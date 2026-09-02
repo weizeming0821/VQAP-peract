@@ -1,0 +1,42 @@
+# 全局配置
+tensor_dtype: float32
+
+# 训练时读取的数据集动作白名单
+train_actions: 
+  - approach
+  - flip-close
+  - flip-open
+  - grasp
+  - hang
+  - insert
+  - lift
+  - place
+  - press
+  - pull
+  - push
+  - revolve-in
+  - revolve-out
+  - rotate
+  - slide
+  - transfer
+  - wipe
+
+# VQAP 输入的动作维度白名单
+train_act_dim:
+  - joint_positions
+  - joint_velocities
+  - gripper_pose
+  - joint_forces
+  - gripper_joint_positions
+  - gripper_touch_forces
+  - gripper_open
+
+# AtomAction_Dataset 相关配置
+atomactiondataset:
+  dataset_root: "AtomAction_Dataset"
+  top_k: 1
+  view_selector:
+    model_name: "dinov2_vits14_reg"
+    repo: "facebookresearch/dinov2"
+    device: null
+    input_size: 224

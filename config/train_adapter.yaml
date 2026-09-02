@@ -1,0 +1,61 @@
+experiment:
+  exp_name: "vqap_adapter"
+  seed: 42
+
+runtime:
+  device: "cuda:0"
+  precision: "bf16"
+  grad_clip_norm: 1.0
+  allow_tf32: true
+  cudnn_benchmark: true
+
+data:
+  index_json: "data/atomaction_codebook_index.json"
+  batch_size: 64
+  num_workers: 32
+  val_num_workers: 8
+  pin_memory: true
+  persistent_workers: true
+  drop_last: true
+  prefetch_factor: 2
+
+train:
+  epochs: 100
+
+lr:
+  base: 3.0e-4
+
+optimizer:
+  beta1: 0.9
+  beta2: 0.99
+  eps: 1.0e-8
+  weight_decay: 1.0e-3
+
+scheduler:
+  warmup_epochs: 3
+  min_lr_ratio: 0.05
+
+loss:
+  lambda_detail: 1.0     # 方案 A：忠实设计文档 §4.5；全局 top-1 不理想时改 0.1 做对照
+  label_smoothing: 0.05
+
+eval:
+  eval_every_epochs: 1
+  topk: [1, 5]
+  # 第 3 层指标（码向量误差）查表用的冻结码本
+  codebook_path: "checkpoints/vqap_pretrain/stage1/codebook.pth"
+  # 指令-only 基线参照线（train 众数 -> val，由 build_adapter_split.py 实测）
+  instruction_only_baseline_global: 0.580
+  instruction_only_baseline_joint: 0.230
+
+checkpoint:
+  root_dir: "checkpoints"
+  save_every_epochs: 5
+  save_trainable_only: true
+
+logging:
+  log_dir: "log"
+
+tensorboard:
+  enable: true
+  log_dir: "tensorboard"

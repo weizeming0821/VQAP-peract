@@ -1,0 +1,136 @@
+AtomAction_NSVQ:
+  ee_branch:
+    hidden_dim: 384
+    output_dim: 192
+  body_branch:
+    hidden_dim: 384
+    output_dim: 192
+  gripper_mech_branch:
+    hidden_dim: 64
+    output_dim: 64
+  gripper_open_branch:
+    output_dim: 64
+  rope:
+    theta: 10000.0
+    max_seq_len: 2048
+  channel_encoder:
+    bottleneck_dim: 64
+  transformer_encoder:
+    hidden_dim: 512
+    num_layers: 4
+    num_heads: 8
+    ffn_dim: 2048
+    dropout: 0.1
+    norm_type: layernorm
+  global_codebook:
+    codebook_size: 36
+    codebook_dim: 512
+  detail_codebook:
+    num_queries: 9
+    num_heads: 4
+    codebook_size: 192
+    codebook_dim: 512
+    dropout: 0.1
+  flow_matching_head:
+    input_dim: 9
+    hidden_dim: 512
+    time_embed_dim: 256
+    time_min_period: 0.004
+    time_max_period: 4.0
+    global_code_dim: 512
+    detail_code_dim: 512
+    num_detail_tokens: 9
+    condition_hidden_dim: 512
+    num_layers: 8
+    num_heads: 8
+    ffn_dim: 2048
+    dropout: 0.1
+    detail_injection_layers: [2, 4, 6, 8]
+    position_branch:
+      num_layers: 2
+      ffn_dim: 2048
+      output_dim: 3
+    rotation_branch:
+      num_layers: 2
+      ffn_dim: 2048
+      output_dim: 6
+    gripper_branch:
+      hidden_dim: 512
+      output_dim: 1
+  nsvq:
+    discard_threshold: 0.1
+    replace_noise_scale: 1.0e-3
+    eps: 1.0e-6
+
+Adapter:
+  hidden_dim: 512
+  image_tokenizer:
+    dinov2:
+      repo: facebookresearch/dinov2
+      model_name: dinov2_vitb14
+      input_size: 224
+      feature_dim: 768
+      feature_type: patch
+    camera_names: [front, wrist]
+    intermediate_size: 128
+    patch_pool: 2
+    freeze: true
+  text_tokenizer:
+    clip:
+      pretrained_path: openai/clip-vit-base-patch16
+      feature_dim: 512
+    freeze: true
+  transformer:
+    num_layers: 4
+    num_heads: 8
+    ffn_dim: 2048
+    dropout: 0.1
+    norm_type: layernorm
+  num_detail_queries: 9
+  global_codebook_size: 36
+  detail_codebook_size: 192
+
+VASA:
+  dinov2:
+    repo: facebookresearch/dinov2
+    model_name: dinov2_vitb14
+    input_size: 224
+    feature_dim: 768
+    feature_type: patch
+  transformer_encoder:
+    hidden_dim: 512
+    num_self_attention_layers: 2
+    num_heads: 8
+    ffn_dim: 2048
+    dropout: 0.1
+    norm_type: layernorm
+  future_predictor:
+    global_code_dim: 512
+    image_feature_dim: 768
+    ffn_hidden_dim: 3072
+  flow_matching_head:
+    input_dim: 9
+    hidden_dim: 512
+    time_embed_dim: 256
+    time_min_period: 0.004
+    time_max_period: 4.0
+    visual_condition_dim: 512
+    condition_hidden_dim: 512
+    num_layers: 8
+    num_heads: 8
+    ffn_dim: 2048
+    dropout: 0.1
+    rope_theta: 10000.0
+    rope_max_seq_len: 2048
+    condition_injection_layers: [1, 2, 3, 4, 5, 6, 7, 8]
+    position_branch:
+      num_layers: 2
+      ffn_dim: 2048
+      output_dim: 3
+    rotation_branch:
+      num_layers: 2
+      ffn_dim: 2048
+      output_dim: 6
+    gripper_branch:
+      hidden_dim: 512
+      output_dim: 1

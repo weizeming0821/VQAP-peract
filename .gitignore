@@ -1,0 +1,24 @@
+# ---- 大体量数据与产物（不入版本控制）----
+AtomAction_Dataset/
+data_rlbench/
+checkpoints/
+planner_cache/
+tensorboard/
+log/
+result/
+
+# ---- 第三方源码：各自有独立 .git，改动在其自身历史里追溯 ----
+#      source/peract  · source/RLBench · source/YARR 均含上游 commit 历史，
+#      `cd source/<repo> && git log` 即可看到本项目的改动与理由。
+#      另含 157MB 权重与 123MB zip，超过 GitHub 单文件 100MB 上限。
+source/
+
+# ---- 密钥 ----
+run/env.local.sh
+
+# ---- 杂项 ----
+__pycache__/
+*.py[cod]
+*.orig
+.vscode/
+.tmp_smoke/
