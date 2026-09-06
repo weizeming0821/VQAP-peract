@@ -86,7 +86,7 @@ def main() -> int:
     section("② 磁盘")
     free_gb = shutil.disk_usage(REPO_ROOT).free / 1024 ** 3
     print(f"       /data0 可用 {free_gb:.0f} GB")
-    check("≥ 220 GB（replay 176 + ckpt 30 + 余量）", free_gb >= 220,
+    check("≥ 240 GB（replay 202 + ckpt 12 + 余量）", free_gb >= 240,
           f"仅 {free_gb:.0f} GB")
     warn("≥ 300 GB（宽松余量；其他用户在持续消耗）", free_gb >= 300)
 
@@ -99,13 +99,13 @@ def main() -> int:
               "place_wine_at_rack_location", "sweep_to_dustpan_of_size"]
     bad = []
     for t in SEEN12:
-        d = REPO_ROOT / "data_rlbench" / "train" / t / "all_variations" / "episodes"
+        d = REPO_ROOT / "aavla_data/rlbench" / "train" / t / "all_variations" / "episodes"
         n = len([e for e in d.glob("episode*") if (e / "low_dim_obs.pkl").is_file()]) if d.is_dir() else 0
         if n != 100:
             bad.append(f"{t}={n}")
     check(f"Seen12 train 每任务 100 episode", not bad, f"异常: {bad}")
     for split, want in (("val", 25), ("test", 25)):
-        n = len(glob.glob(str(REPO_ROOT / "data_rlbench" / split / "*" /
+        n = len(glob.glob(str(REPO_ROOT / "aavla_data/rlbench" / split / "*" /
                               "all_variations" / "episodes" / "episode*" / "low_dim_obs.pkl")))
         check(f"{split} 共 {18*want} episode（实测 {n}）", n == 18 * want)
 
@@ -138,10 +138,12 @@ def main() -> int:
         check(f"{name} checkpoint 存在", f.is_file())
     check("CLIP RN50 权重已缓存（urllib 走代理会 SSL 失败）",
           (Path.home() / ".cache" / "clip" / "RN50.pt").is_file())
-    for arm in ("B1", "B2", "B3"):
-        p = REPO_ROOT / "logs" / "stage3" / arm / "seed0" / "weights" / "0" / "QAttentionAgent_layer0.pt"
+    from omegaconf import OmegaConf as _OC
+    _logdir = Path(str(_OC.load(PERACT_ROOT / "conf" / "stage3.yaml").framework.logdir))
+    for arm in ("B1", "B2", "B3", "B4"):
+        p = _logdir / arm / "seed0" / "weights" / "0" / "QAttentionAgent_layer0.pt"
         check(f"{arm} 的 iteration-0 权重已装（从官方起步）", p.is_file(),
-              "跑 scripts/init_from_official.py")
+              f"跑 scripts/init_from_official.py --logdir {_logdir}")
 
     # ---------------------------------------------------------------- 配置
     section("⑥ 训练配置")
@@ -186,30 +188,67 @@ def main() -> int:
     check("冻结在 QFunction 构造之前（否则 DDP 等不到梯度）",
           ag.index("STAGE3_TRAINABLE_MODULES) \n" if False else "self._perceiver_encoder.named_parameters()")
           < ag.index("self._q = QFunction("))
+    # ---- P5 审计新增 ----
+    check("P0-2: run_seed_fn 用 replay 工件（已建则跳过 fill）",
+          "replay_dataset.is_built" in rs and "replay_dataset.attach" in rs)
+    check("P0-2: 只有 rank0 填 replay（杜绝并发写同名文件）",
+          "_wait_for_artifact" in rs and "if rank != 0" in rs)
+    check("P0-3: act() 对 B2/B3 缺子任务指令硬失败",
+          "subtask_lang_goal_tokens" in ag and "uses_subtask_lang" in ag)
+    check("P6: eval.py 对 B2/B3 换用带 Planner 的 rollout generator",
+          "Stage3RolloutGenerator" in (PERACT_ROOT / "eval.py").read_text())
+    check("update_summaries 跳过冻结参数（否则 add_histogram 收到 None）",
+          "if not param.requires_grad:" in ag and "param.grad is not None" in ag)
+    check("优化器/调度器状态随 checkpoint 持久化",
+          "OPTIM_SUFFIX" in ag and "'optimizer': self._optimizer.state_dict()" in ag
+          and "self._optimizer.load_state_dict" in ag)
 
     # ---------------------------------------------------------------- 单测
     section("⑧ 单测")
-    for t in ("test_code_injector", "test_peract_integration", "test_stage3_arms",
-              "test_act_codes", "test_planner_contract"):
+    FAST = ("test_code_injector", "test_peract_integration", "test_stage3_arms",
+            "test_act_codes", "test_planner_contract", "test_online_planner")
+    # 慢测（各需真跑一次 fill_replay，约 1-3 分钟），--fast 可跳过
+    # test_train_smoke 走 train.py 的真实入口（DataLoader spawn worker + log_freq
+    # 摘要 + save_freq 存盘），P5 连炸的两个 bug 都只有它能抓到。约 4 分钟。
+    SLOW = ("test_fill_replay_stage3", "test_replay_artifact", "test_resume_exact",
+            "test_train_smoke")
+    tests = FAST if "--fast" in sys.argv else FAST + SLOW
+    for t in tests:
         r = subprocess.run([sys.executable, str(REPO_ROOT / "tools" / f"{t}.py")],
-                           capture_output=True, text=True, timeout=900)
-        check(f"{t}", r.returncode == 0, (r.stdout + r.stderr)[-200:])
+                           capture_output=True, text=True, timeout=2400)
+        check(f"{t}", r.returncode == 0, (r.stdout + r.stderr)[-300:])
+    if "--fast" in sys.argv:
+        warn("已跳过 3 个慢测（--fast）", False, f"{SLOW}")
 
     # ---------------------------------------------------------------- replay
-    section("⑨ 共享 replay（尚未构建则提示）")
+    section("⑨ 共享 replay 工件")
     try:
-        rp = Path(OmegaConf.load(cfg_p).replay.path)
-        marker = rp / "_BUILD_COMPLETE.json"
-        if marker.is_file():
-            info = json.loads(marker.read_text())
-            check(f"replay 已完整：{info['n_samples']:,} 样本 / {info['size_gb']:.0f} GB",
-                  info["n_samples"] > 130000)
-            check("含 subtask 字段", info.get("subtask_fields") is True)
+        from stage3 import replay_dataset
+        cfg = OmegaConf.load(cfg_p)
+        art = replay_dataset.replay_dir(cfg.replay.path, list(cfg.rlbench.tasks),
+                                        "PERACT_BC", int(cfg.framework.start_seed))
+        # 🔴 P0-1 的回归：构建脚本与 run_seed_fn 必须算出同一个目录。
+        #    这里复刻 run_seed_fn.py 的拼法，两边对不上就是 bug 回来了。
+        tasks = list(cfg.rlbench.tasks)
+        expect = os.path.join(str(cfg.replay.path),
+                              "multi" if len(tasks) > 1 else tasks[0],
+                              "PERACT_BC", "seed%d" % int(cfg.framework.start_seed))
+        check("P0-1: build_replay 与 run_seed_fn 的 replay 路径一致",
+              os.path.normpath(str(art)) == os.path.normpath(expect),
+              f"{art} vs {expect}")
+        print(f"       工件目录 {art}")
+        if replay_dataset.is_built(art):
+            man = replay_dataset.read_manifest(art)
+            check(f"replay 工件已建：{man['n_samples']:,} 落盘文件",
+                  man["n_samples"] > 160000)
+            check("含 subtask 字段", man.get("subtask_fields") is True)
+            n_task = len(man.get("per_task", {}))
+            check(f"逐任务计数覆盖 {n_task} 个任务", n_task == len(tasks))
         else:
-            warn("replay 尚未构建", False,
-                 "跑 python scripts/build_replay.py（约 176 GB / 30 分钟）")
+            warn("replay 工件尚未构建", False,
+                 "跑 python scripts/build_replay.py（约 202 GB / 30 分钟）")
     except Exception as exc:
-        warn("replay 检查", False, str(exc)[:60])
+        warn("replay 检查", False, f"{type(exc).__name__}: {str(exc)[:80]}")
 
     print(f"\n{'='*78}")
     print(f"预检结果: {'PASS' if OK else 'FAIL'}   （{WARN} 项警告）")

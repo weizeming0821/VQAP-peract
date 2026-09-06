@@ -179,7 +179,7 @@ def main() -> int:
     jobs = []
     for task in args.tasks:
         for e in range(args.episodes):
-            ep = f"data_rlbench/train/{task}/all_variations/episodes/episode{e}"
+            ep = f"aavla_data/rlbench/train/{task}/all_variations/episodes/episode{e}"
             if not os.path.isfile(f"{ep}/low_dim_obs.pkl"):
                 continue
             demo = Demo(pickle.load(open(f"{ep}/low_dim_obs.pkl", "rb")))

@@ -176,3 +176,144 @@ def load_codebook(path: str, device: str | torch.device = "cpu") -> CodebookLook
     g = next(v for v in ck["global_codebook"].values() if v.ndim == 2)
     d = next(v for v in ck["detail_codebook"].values() if v.ndim == 2)
     return CodebookLookup(g, d).to(device).eval()
+
+
+# ==================================================================== v2
+
+class CodeInjectorV2(nn.Module):
+    """B4 的注入层 —— 去掉门控与 FiLM，改成两条**纯残差相加**的支路。
+
+        h   = latents + M(z_g)          全局码：MLP 后直接逐通道相加，空间上广播
+        out = h + cross_attn(h, Z_d)    细节码：cross-attn 残差
+
+    # 为什么这么改（v1 的实测证据）
+
+    v1 用 `gate ⊙ o` 做门控、`w_film` 做 FiLM，两者都**零初始化**。实测走完
+    100000 步：
+
+        gate 范数        0.0036 → 0.0061（1.7×）
+        注入改变 latents  0.0056% → 0.0095%
+        B1@40000 = B3@40000 = 35.33%    码本贡献为零
+
+    根因是 LAMB 的更新式 `‖Δp‖ ≡ lr·‖p‖` —— 步长正比于参数自身范数，
+    零初始化张量只有第一步是自由的（`‖p‖=0` 时 trust_ratio=1），之后被锁进
+    每步至多长 lr 的倍增。100000 步允许 e¹⁰=22026 倍，实际只长了 1.7 倍，
+    说明驱动力也只有天花板的 5%（打开门带来的损失下降太小，自我锁死）。
+
+    **v2 直接删掉门控。** 实测 `o` 的 rms 是 latents 的 0.177 ——
+    去掉 gate 之后注入幅度从 0.0064% 变成 17.7%，**2760 倍**，
+    不需要改优化器、不需要参数分组，那个坑从源头消失。
+
+    # 初始化
+
+        w_g  normal(std=0.01)   全局码初始注入约 16%
+        w_o  normal(std=0.02)   细节码初始注入约 17.7%（与 v1 相同，未改）
+
+    两条都是**正常尺度**（不是零），所以 `lr·‖p‖` 从一开始就是正常步长。
+    不加 warmup（保留现有训练框架），代价是训练第一步就有约三成扰动 ——
+    这是刻意的取舍：v1 的教训是「注入太弱」，宁可偏大也不要再被锁死。
+
+    # 关于 code_mask
+
+    `code_mask=0` **只在 action == pose-adjust 时发生，实测占 112/10323 = 1.08%**。
+    所以「mask=0 时与原版逐位等价」不是一条有实际保护作用的安全网
+    （98.9% 的样本走 mask=1 的路径）。保留乘法结构是为了**单测锚点**：
+    mask=0 时输出必须与输入 bit-exact，这条断言能抓住乘/加写反之类的实现 bug。
+
+    # 细节码支路的已知退化（保留，如实记录）
+
+    实测 9 个槽位**完全相同**的段占 82.8%，此时 cross-attn 的 K/V 只差一个
+    与输入无关的 slot_embed，退化为「1 个码向量 + 9 个常量」。
+    剩下 17.2% 的样本槽位确实不同，那部分 cross-attn 是有意义的。
+    报告细节码相关指标时须注明这一点（`Adapter_Design §7 R1`）。
+    """
+
+    #: 全局码投影的初始化尺度。决定初始注入幅度（0.01 → 约 16%）。
+    W_G_STD = 0.01
+    #: 细节码输出投影的初始化尺度。与 v1 相同，实测注入约 17.7%。
+    W_O_STD = 0.02
+
+    def __init__(self, dim: int = 128, code_dim: int = 512, n_slots: int = 9,
+                 hidden: int = 256, heads: int = 4, use_detail: bool = True) -> None:
+        super().__init__()
+        self.dim = dim
+        self.n_slots = n_slots
+        self.heads = heads
+        self.use_detail = use_detail
+
+        # ---- (a) 全局码 → 逐通道残差 ----
+        self.ln_g = nn.LayerNorm(code_dim)
+        self.mlp_g = nn.Sequential(
+            nn.Linear(code_dim, hidden), nn.SiLU(),
+            nn.Linear(hidden, hidden), nn.SiLU(),
+        )
+        self.w_g = nn.Linear(hidden, dim)          # v1 这里是 w_film(hidden, 2*dim)
+
+        # ---- (b) 细节码 → cross-attention 残差（结构同 v1，只是没有 gate）----
+        if use_detail:
+            assert dim % heads == 0, f"dim {dim} 必须能被 heads {heads} 整除"
+            self.slot_embed = nn.Parameter(torch.randn(n_slots, code_dim) * 0.02)
+            self.ln_h = nn.LayerNorm(dim)
+            self.w_q = nn.Linear(dim, dim, bias=False)
+            self.w_k = nn.Linear(code_dim, dim, bias=False)
+            self.w_v = nn.Linear(code_dim, dim, bias=False)
+            self.w_o = nn.Linear(dim, dim, bias=False)
+
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        for m in self.mlp_g:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
+        # 🔴 w_g 用小随机而非零初始化 —— 零初始化正是 v1 被 LAMB 锁死的原因
+        nn.init.normal_(self.w_g.weight, std=self.W_G_STD)
+        nn.init.zeros_(self.w_g.bias)
+        if self.use_detail:
+            for w in (self.w_q, self.w_k, self.w_v):
+                nn.init.xavier_uniform_(w.weight)
+            nn.init.normal_(self.w_o.weight, std=self.W_O_STD)
+
+    # ------------------------------------------------------------------
+    def _cross_attn(self, h: torch.Tensor, Z_d: torch.Tensor) -> torch.Tensor:
+        """h [B,C,X,Y,Z] × Z_d [B,S,code_dim] → O [B,C,X,Y,Z]（与 v1 相同）"""
+        b, c = h.shape[0], h.shape[1]
+        spatial = h.shape[2:]
+        tok = h.reshape(b, c, -1).transpose(1, 2)             # [B,N,C]
+        s = Z_d + self.slot_embed.unsqueeze(0)                # [B,S,code_dim]
+
+        q = self.w_q(self.ln_h(tok))
+        k = self.w_k(s)
+        v = self.w_v(s)
+        hd = c // self.heads
+        q = q.view(b, -1, self.heads, hd).transpose(1, 2)
+        k = k.view(b, -1, self.heads, hd).transpose(1, 2)
+        v = v.view(b, -1, self.heads, hd).transpose(1, 2)
+        o = F.scaled_dot_product_attention(q, k, v)
+        o = o.transpose(1, 2).reshape(b, -1, c)
+        o = self.w_o(o)
+        return o.transpose(1, 2).reshape(b, c, *spatial)
+
+    def forward(self, latents: torch.Tensor, z_g: torch.Tensor,
+                Z_d: torch.Tensor | None = None,
+                code_mask: torch.Tensor | None = None) -> torch.Tensor:
+        b, c = latents.shape[0], latents.shape[1]
+        n_spatial = latents.dim() - 2
+        bc_shape = (b, c) + (1,) * n_spatial
+        m_shape = (b, 1) + (1,) * n_spatial
+        m = (latents.new_ones(b, 1) if code_mask is None
+             else code_mask.reshape(b, 1).to(latents.dtype))
+
+        # (a) 全局码：逐通道残差，空间上广播
+        g = self.w_g(self.mlp_g(self.ln_g(z_g)))              # [B,C]
+        h = latents + g.view(bc_shape) * m.view(m_shape)
+
+        # (b) 细节码：cross-attn 残差，**没有门控**
+        if not self.use_detail or Z_d is None:
+            return h
+        o = self._cross_attn(h, Z_d)
+        return h + o * m.view(m_shape)
+
+    # ------------------------------------------------------------------
+    def n_trainable(self) -> int:
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)

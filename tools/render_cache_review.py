@@ -6,7 +6,7 @@ segment 归组与指令，供人工快速判读。
 
 用法：
     source run/env.sh
-    python tools/render_cache_review.py --cache-dir planner_cache/train \
+    python tools/render_cache_review.py --cache-dir aavla_data/planner_cache/train \
         --out-dir result/p3_planner_cache/review --limit 100
 """
 
@@ -87,8 +87,8 @@ def render(ep: dict, data_root: Path, out_path: Path, views=("front", "wrist")) 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--cache-dir", default=str(REPO_ROOT / "planner_cache" / "train"))
-    ap.add_argument("--data-root", default=str(REPO_ROOT / "data_rlbench"))
+    ap.add_argument("--cache-dir", default=str(REPO_ROOT / "aavla_data" / "planner_cache" / "train"))
+    ap.add_argument("--data-root", default=str(REPO_ROOT / "aavla_data/rlbench"))
     ap.add_argument("--out-dir", default=str(REPO_ROOT / "result" / "p3_planner_cache" / "review"))
     ap.add_argument("--limit", type=int, default=100)
     ap.add_argument("--per-task", type=int, default=3)

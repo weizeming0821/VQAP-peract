@@ -13,7 +13,7 @@ CSV 是**软先验**（VLA_Design §4.9），偏离本身不算错——真正�
 
 用法：
     source run/env.sh
-    python tools/review_cache_vs_prior.py --cache-dir planner_cache/train \
+    python tools/review_cache_vs_prior.py --cache-dir aavla_data/planner_cache/train \
         --out result/p3_planner_cache/prior_review.json
 """
 
@@ -52,7 +52,7 @@ def seq_diff(prior: list[str], got: list[str]) -> list[str]:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--cache-dir", default=str(REPO_ROOT / "planner_cache" / "train"))
+    ap.add_argument("--cache-dir", default=str(REPO_ROOT / "aavla_data" / "planner_cache" / "train"))
     ap.add_argument("--out", default=str(REPO_ROOT / "result" / "p3_planner_cache" / "prior_review.json"))
     ap.add_argument("--samples", type=int, default=2, help="每任务打印几条指令样例")
     args = ap.parse_args()

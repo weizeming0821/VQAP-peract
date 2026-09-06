@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_CACHE_DIR = REPO_ROOT / "planner_cache" / "train"
+DEFAULT_CACHE_DIR = REPO_ROOT / "aavla_data" / "planner_cache" / "train"
 
 
 class CacheError(RuntimeError):

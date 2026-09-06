@@ -43,7 +43,7 @@ def main() -> int:
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
     cfg = OmegaConf.create({
-        "rlbench": {"demo_path": str(REPO_ROOT / "data_rlbench" / "train"),
+        "rlbench": {"demo_path": str(REPO_ROOT / "aavla_data/rlbench" / "train"),
                     "episode_length": 25, "cameras": ["front", "left_shoulder",
                                                       "right_shoulder", "wrist"],
                     "camera_resolution": [128, 128], "scene_bounds":
@@ -87,10 +87,12 @@ def main() -> int:
         print("=== 2. 真跑 fill_replay ===")
         clip_model, _ = load_clip("RN50", jit=False, device=device)
         clip_model = build_model(clip_model.state_dict()).to(device)
-        text_cache = TextEmbedCache(clip_model, device)
         obs_config = utils.create_obs_config(
             cfg.rlbench.cameras, cfg.rlbench.camera_resolution, "PERACT_BC")
 
+        # planner_cache_dir 传的是**路径字符串**：fill_multi_task_replay 用 Process
+        # 逐任务 spawn，所有参数必须可 pickle，而 TextEmbedCache 持有 CUDA 上的 CLIP
+        # 模型、不可 pickle。fill_replay 自己按路径构建两者。
         fill_replay(cfg=cfg, obs_config=obs_config, rank=0, replay=replay,
                     task=task, num_demos=n_demos, demo_augmentation=True,
                     demo_augmentation_every_n=10, cameras=cfg.rlbench.cameras,
@@ -101,14 +103,16 @@ def main() -> int:
                     crop_augmentation=cfg.method.crop_augmentation,
                     clip_model=clip_model, device=device,
                     keypoint_method="heuristic",
-                    planner_cache=cache, split="train",
-                    text_embed_cache=text_cache)
+                    planner_cache_dir=str(cache.cache_dir), data_split="train")
         n = replay.add_count
         check(f"写入 {n} 个样本", n > 0)
-        print(f"       {text_cache.stats()}")
-        check("文本编码有缓存命中（唯一指令数 << 样本数）",
-              text_cache.misses < max(text_cache.hits, 1),
-              f"unique={text_cache.misses} calls={text_cache.hits+text_cache.misses}")
+
+        # TextEmbedCache 的记忆化单独验（fill_replay 内部那份取不到）
+        text_cache = TextEmbedCache(clip_model, device)
+        for _ in range(5):
+            text_cache("grasp the jar lid")
+        check("TextEmbedCache 记忆化生效（5 次调用只编码 1 次）",
+              text_cache.misses == 1 and text_cache.hits == 4, text_cache.stats())
 
         print("=== 3. 采样一个 batch，验证字段内容 ===")
         batch = replay.sample_transition_batch(pack_in_dict=True)
@@ -159,6 +163,23 @@ def main() -> int:
                     keypoint_method="heuristic")
         check(f"带 subtask {n} == baseline {replay2.add_count}",
               n == replay2.add_count)
+
+        print("=== 6. replay 工件：save -> attach 往返 ===")
+        from stage3 import replay_dataset
+        man = replay_dataset.save(replay, tmp, extra={"tasks": [task], "demos": n_demos})
+        check(f"manifest 记录 {man['n_samples']} 样本", man["n_samples"] == int(n))
+        fresh = create_replay(
+            batch_size=2, timesteps=1, prioritisation=False, task_uniform=True,
+            save_dir=str(tmp), cameras=cfg.rlbench.cameras,
+            voxel_sizes=cfg.method.voxel_sizes, replay_size=int(1e4),
+            stage3_subtask_fields=True)
+        replay_dataset.attach(fresh, tmp, verbose=False)
+        check("attach 后 add_count 一致", int(fresh.add_count) == int(n))
+        check("attach 后 task_idxs 一致",
+              {k: sorted(v) for k, v in fresh._task_idxs.items()} ==
+              {k: sorted(map(int, v)) for k, v in replay._task_idxs.items()})
+        b = fresh.sample_transition_batch(pack_in_dict=True)
+        check("attach 后能正常采样", b["subtask_k_global"] is not None)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

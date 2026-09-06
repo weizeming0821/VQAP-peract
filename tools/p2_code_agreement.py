@@ -210,7 +210,7 @@ def main() -> int:
 
     records: list[dict] = []
     for task in args.tasks:
-        eps = sorted(glob.glob(f"data_rlbench/{args.split}/{task}/all_variations/episodes/episode*"),
+        eps = sorted(glob.glob(f"aavla_data/rlbench/{args.split}/{task}/all_variations/episodes/episode*"),
                      key=lambda p: int(os.path.basename(p).removeprefix("episode")))
         eps = [e for e in eps if os.path.isfile(f"{e}/low_dim_obs.pkl")][:args.episodes]
         n_seg = 0

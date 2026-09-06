@@ -1,0 +1,713 @@
+"""在线 VLM Planner —— 模板法的备选方案（贴近原设计）。
+
+# 和模板法的区别
+
+模板法把子任务序列**开跑前就定死**，只靠夹爪翻转和关键帧预算推进，是开环的：
+模型一旦走偏，计划不会跟着调整。在线 VLM 每个关键帧看一眼当前画面，
+判断「现在该做第几步」，是闭环的。
+
+# 当前版本的约束（**是阶段性取舍，不是原理限制**）
+
+本版**子任务序列仍来自模板库，VLM 只负责选下标**。这么做只是为了先把闭环
+链路跑通、失败模式可枚举。
+
+⚠️ 早先这里写过「码 k_global/k_detail 只能从 cache 里查，VLM 现编不出来」——
+**那是错的**。设计（`VLA_Design §3`、`Adapter_Design §4`）里码本来就由
+**Stage 2 Adapter** 从 `(front+wrist 观测, 子任务指令)` 预测得到；
+`checkpoints/vqap_adapter/best.pth` 已训练完成（val global_top1 0.897），
+离线 cache 里的码就是它算的（`scripts/planner_cache.py` 的 codes 步骤）。
+所以 VLM 自由生成子任务指令 → Adapter 现场出码，这条路是通的，
+缺的只是「评测时实时调 Adapter」这一段接线。
+
+而且 planner 的指令并非自由文本：`planner/prompts.py` 用固定动作词表
+（17 个码本动作 + pose-adjust）、固定起始动词表、3–8 词、小写无尾标点
+约束输出，`normalize_instruction` 离线在线共用 —— 生成的指令天然落在
+Adapter 与 PerAct 的训练分布内。
+
+# 成本与延迟
+
+每个关键帧一次调用，串在 rollout 里。实测评测每局约 26 步，
+10 局/任务 × 12 任务 = 120 局 ≈ 3100 次调用。12 个分片并行，
+每片约 260 次串行调用。`PlannerClient` 按 sha256(model + messages) 磁盘记忆化，
+所以**重跑同一份评测不再付费，且结果逐位可复现**。
+
+# 失败即报错，不做静默退化
+
+VLM 调用失败（超时、限流、返回不可解析）直接抛错，让这一局评测失败。
+
+早先的版本是「失败就退回模板法的推进规则」，那是**错的设计**：退化是静默的，
+最后拿到一份「VLM 方案」的成绩单，里面可能混着大量实际由模板法产生的步骤，
+数字说不清是什么。`PlannerClient` 本身带 4 次指数退避重试，真到了抛错这一步，
+说明服务确实不可用 —— 那就该停下来修，而不是偷偷换一套规则继续跑。
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import threading
+
+from pathlib import Path
+
+from stage3.online_planner import DeterministicPlanner, PlannerError
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+#: 单次决策最多前进几步。v2 试过 2（多段跳），没有收益、反而助长「推太快」，
+#: v3 回到 1。
+MAX_ADVANCE = 1
+#: 送进 VLM 的视角。front 看全局进度，wrist 看有没有抓住东西。
+DEFAULT_VIEWS = ("front", "wrist")
+
+
+class VLMPlanner(DeterministicPlanner):
+    """继承确定性状态机，只把「推进与否」的判断换成 VLM。
+
+    继承而不是另起一个类，是为了让退化路径**天然存在**：
+    VLM 不可用时直接调用父类的 `observe`，行为与模板法逐字相同。
+    """
+
+    def __init__(self, subtasks, task: str, task_instruction: str,
+                 client, views=DEFAULT_VIEWS, img_size: int = 224) -> None:
+        super().__init__(subtasks)
+        self.task = task
+        self.task_instruction = task_instruction
+        self._client = client
+        self._views = tuple(views)
+        self._img_size = img_size
+        self.stats = {"call": 0, "fail": 0,
+                      "advance": 0, "stay": 0, "clamped": 0}
+        self.decisions: list[dict] = []
+
+    # ------------------------------------------------------------------
+    def observe(self, gripper_open: float | None, frame=None) -> None:
+        self.t += 1
+        self.used += 1
+        if gripper_open is not None:
+            self.prev_gripper = float(gripper_open)
+        last = len(self.subtasks) - 1
+        if self.idx >= last:
+            return                                  # 已在最后一段，无需再问
+        if not frame:
+            raise PlannerError(
+                "在线 VLM planner 拿不到相机图像。observation 里应有 "
+                f"{'/'.join(self._views)}_rgb —— 检查 eval.yaml 的 rlbench.cameras。")
+
+        try:
+            idx = self._ask(gripper_open, frame)
+        except Exception as e:                      # 超时 / 限流 / 解析失败
+            self.stats["fail"] += 1
+            self.decisions.append({"t": self.t, "error": f"{type(e).__name__}: {e}"[:200]})
+            # 不退化：静默换规则会让「VLM 方案」的成绩单里混进模板法的步骤。
+            raise PlannerError(
+                f"在线 VLM planner 调用失败（{type(e).__name__}: {e}）。"
+                f"客户端已重试 4 次仍不可用，本局评测中止。") from e
+
+        raw = idx
+        idx = min(max(idx, self.idx), min(self.idx + MAX_ADVANCE, last))
+        if idx != raw:
+            self.stats["clamped"] += 1
+        self.stats["advance" if idx > self.idx else "stay"] += 1
+        if idx != self.idx:
+            self.idx = idx
+            self.used = 0
+
+    # ------------------------------------------------------------------
+    def _ask(self, gripper_open, frame: dict) -> int:
+        from planner.client import image_data_url_from_array
+        from planner.prompts import (build_online_system_prompt,
+                                     build_online_user_content)
+        images = []
+        for v in self._views:
+            arr = frame.get(v)
+            if arr is not None:
+                images.append((v, image_data_url_from_array(arr, self._img_size)))
+        if not images:
+            raise PlannerError("observation 里没有可用的相机图像")
+        msgs = [{"role": "system", "content": build_online_system_prompt()},
+                {"role": "user",
+                 "content": build_online_user_content(
+                     self.task, self.task_instruction, self.subtasks,
+                     self.idx, gripper_open, images)}]
+        self.stats["call"] += 1
+        out = self._client.chat(msgs)
+        idx, reason = _parse(out["content"])
+        self.decisions.append({"t": self.t, "from": self.idx, "to": idx,
+                               "reason": reason})
+        return idx
+
+
+def _parse(text: str) -> tuple[int, str]:
+    """从模型输出里抠出 index。容忍代码围栏和前后废话。"""
+    s = (text or "").strip()
+    s = re.sub(r"^```(?:json)?|```$", "", s, flags=re.M).strip()
+    try:
+        d = json.loads(s)
+        return int(d["index"]), str(d.get("reason", ""))[:60]
+    except Exception:
+        pass
+    m = re.search(r'"index"\s*:\s*(\d+)', s) or re.search(r"\b(\d+)\b", s)
+    if not m:
+        raise PlannerError(f"无法从输出解析 index: {s[:120]!r}")
+    return int(m.group(1)), "(parsed from raw text)"
+
+
+# ---------------------------------------------------------------- 工厂
+
+class VLMPlanFactory:
+    """和 `PlanFactory` 一样是模块级类（spawn 子进程要 pickle）。
+
+    client 与 bank 都延迟到子进程里建：`OpenAI` 客户端持有 socket，
+    pickle 不过去；bank 是 550 KB 的字典，没必要序列化 12 份。
+    """
+
+    kind = "vlm"
+
+    def __init__(self, split: str, model: str | None = None,
+                 views=DEFAULT_VIEWS, verbose: bool = True) -> None:
+        self.split = split
+        self.model = model or os.environ.get("AAVLA_ONLINE_PLANNER_MODEL",
+                                             "qwen3.8-max")
+        self.views = tuple(views)
+        self._verbose = verbose
+        self._bank = None
+        self._client = None
+        self._lock = None
+        self.bank                                   # 父进程尽早失败
+        if not os.environ.get("DASHSCOPE_API_KEY"):
+            raise PlannerError(
+                "在线 VLM planner 需要 DASHSCOPE_API_KEY / DASHSCOPE_BASE_URL。"
+                "先 source run/env.sh")
+
+    @property
+    def bank(self):
+        if self._bank is None:
+            from stage3.planners import plan_file
+            from stage3.online_planner import PlanBank
+            # 计划序列仍取自模板库：VLM 只选下标，不改写计划（见模块 docstring）
+            self._bank = PlanBank(plan_file(self.split, "template"))
+            if self._verbose:
+                print(f"[planner] kind=vlm model={self.model} "
+                      f"views={','.join(self.views)} {self._bank.summary()}",
+                      flush=True)
+        return self._bank
+
+    @property
+    def client(self):
+        if self._client is None:
+            from planner.client import PlannerClient
+            # 关掉思考链 + 收紧 max_tokens：答案只有一行 JSON，
+            # 而带思考时模型会先吐几百到三千个 token，延迟正比于此。
+            # 实测 30s/次 -> 约 1s/次，全量评测从 26 小时降到 1 小时以内。
+            self._client = PlannerClient(
+                model=self.model, max_tokens=256,
+                extra_body={"enable_thinking": False})
+        return self._client
+
+    def __getstate__(self) -> dict:
+        d = dict(self.__dict__)
+        d["_bank"] = None
+        d["_client"] = None                          # 持有 socket，pickle 不过去
+        d["_lock"] = None
+        return d
+
+    def __call__(self, task: str, episode: int):
+        from stage3.online_planner import episode_descriptions
+        subs = self.bank.get(task, episode)
+        d = episode_descriptions(task, self.split, episode)
+        return VLMPlanner(subs, task, d[0] if d else task.replace("_", " "),
+                          self.client, self.views)
+
+    def summary(self) -> str:
+        return f"VLM({self.model}) over {self.bank.summary()}"
+
+
+# ============================================================ 真·在线 planner
+
+#: 触发 MONITOR 的心跳间隔（关键帧）。demo 每段中位 1–2 帧，4 帧足以覆盖
+#: 正常推进而不至于漏判；调小更灵敏但更贵。
+#: 心跳间隔（关键帧）。实测：心跳 4 → 6.4 次调用/局；心跳 2 → 9.5 次/局。
+HEARTBEAT = int(os.environ.get("AAVLA_PLANNER_HEARTBEAT", "3"))
+#: 单段占用超过这么多关键帧就判定为「停滞」。
+#: 🔴 v3 改变了停滞的**处理方式**：v2 是本地强制前进，实测把 NEXT 从 42%
+#:    推到 72%，成绩反而从 26.67% 掉到 22.33% —— 盲目往前推不解决问题。
+#:    v3 改成「照常问 VLM，但把『已经在这一步耗了 N 帧』作为事实告诉它」，
+#:    因为 v1 实测连判 6 次 REPLAN、每次生成几乎相同的计划 —— 它没收到任何
+#:    新信息，重规划自然是原样重来。
+STALL_LIMIT = 4
+#: 关节速度的「停了」阈值（rad/s，取无穷范数）。
+VEL_EPS = 0.01
+#: 末端位姿的「没动」阈值（米）。
+POSE_EPS = 0.005
+#: 速度/位姿判定要连续命中几帧才算数 —— 单帧为零可能只是运动规划的间隙。
+QUIET_FRAMES = 2
+#: 每局的调用上限（成本护栏）。
+#: 🔴 实测 200 局：调用/局 中位 13、p90 15、max 22 —— 原来的 12 会在 **52%**
+#:    的局上触顶，等于一半的局中途失去 planner。按 p90 留余量取 25。
+MAX_CALLS = 25
+#: 同一段最多重试几次。实测 RETRY/局 中位 0、p90 3。
+MAX_RETRY = 4
+#: 每局最多重规划几次。实测 6% 的局触顶 2；v3 把停滞导向 REPLAN 后需求上升。
+MAX_REPLAN = 4
+
+
+class OnlineVLMPlanner:
+    """开局现场规划 + 触发式进度判定 + 失败重试/重规划。
+
+    与 `VLMPlanner`（在模板库给的序列里选下标）的根本区别：
+    **子任务序列由 VLM 看着画面推理生成，完全不读模板库。** 这样模板库的
+    结构性问题（22% 模板只有 1 条源局支撑、8 局回退时指令与场景物体不符、
+    预算来自 demo 关键帧数而评测要走 26 步）一个都不会带进来。
+
+    CSV 先验（`Phase_Action_Label.csv`）只作**参考**送进 prompt：
+    它给出「涉及哪些动作、大致什么顺序」，以及由 variation 号确定性推出的
+    **重复次数**（后者是事实，不是粒度选择，所以仍是硬约束 ——
+    实测加上它之后 stack_blocks 的规划一致率从 0% 升到 100%）。
+    粒度允许与离线分段不同：目标是把任务做成，不是复刻离线分段。
+
+    码不来自计划，必须配 `--codes adapter`（实时 Adapter）——
+    VLM 生成的指令是新的，模板库里没有对应的码可查。
+    """
+
+    def __init__(self, task: str, task_instruction: str, client,
+                 prior: list[str] | None = None, n_repeat: int | None = None,
+                 phrasings: list[str] | None = None,
+                 views=DEFAULT_VIEWS, img_size: int = 224,
+                 heartbeat: int = HEARTBEAT) -> None:
+        self.task = task
+        self.task_instruction = task_instruction
+        self._client = client
+        self._prior = list(prior or [])
+        self._n_repeat = n_repeat
+        # 该 (task, variation) 的真实训练指令。作为软参考进 prompt：
+        # 既示范指令该长什么样，也钉住这个场景里物体的正确名字与颜色。
+        self._phrasings = list(phrasings or [])
+        self._views = tuple(views)
+        self._img_size = img_size
+        self._heartbeat = heartbeat
+
+        self.subtasks: list[dict] = []
+        self.done: list[dict] = []       # 已完成的段，REPLAN 时告诉 VLM
+        self.idx = 0
+        self.t = 0
+        self.used = 0
+        self.last_ask = 0
+        self.code_epoch = 0              # NEXT/RETRY/REPLAN 时 +1 -> 让 Adapter 重算
+        self.retry = 0
+        self.n_replan = 0
+        self.prev_gripper: float | None = None
+        self.prev_pose = None          # 上一帧的末端位姿（xyz），用于位移判定
+        self.quiet = 0                 # 连续「静止」的帧数
+        self.history: list[dict] = []
+        self.decisions: list[dict] = []
+        self.stats = {"plan_call": 0, "monitor_call": 0, "fail": 0,
+                      "CONTINUE": 0, "NEXT": 0, "RETRY": 0, "REPLAN": 0,
+                      "budget_exhausted": 0, "trigger_flip": 0,
+                      "trigger_heartbeat": 0, "trigger_quiet": 0,
+                      "trigger_stall": 0, "no_robot_state": 0}
+
+    # ---------------------------------------------------------- 对外协议
+    @property
+    def current(self) -> dict:
+        return self.subtasks[min(self.idx, len(self.subtasks) - 1)]
+
+    @property
+    def budgets(self) -> list[int]:
+        """轨迹落盘要读这个字段；本 planner 不用预算，给个占位。"""
+        return [1] * len(self.subtasks)
+
+    def prime(self, gripper_open: float | None, frame=None) -> None:
+        """第一次 act()：建立夹爪基线，并**现场规划**出初始子任务序列。"""
+        if gripper_open is not None:
+            self.prev_gripper = float(gripper_open)
+        if not frame:
+            raise PlannerError(
+                "vlm-plan 需要初始观测来做规划，但没拿到相机图像。"
+                f"检查 eval.yaml 的 rlbench.cameras 是否含 {'/'.join(self._views)}。")
+        self.subtasks = self._plan(frame)
+
+    def note(self, step: int) -> None:
+        st = self.current
+        self.history.append({"t": len(self.history), "subtask_index": self.idx,
+                             "action": st["action"], "gripper": self.prev_gripper,
+                             "instruction": st["instruction"]})
+
+    def observe(self, gripper_open: float | None, frame=None, robot=None) -> None:
+        """执行完一个关键帧后判定进度。
+
+        `robot` 是 env 旁路给的机器人低维状态（关节速度 / 末端位姿），
+        由 `custom_rlbench_env.extract_obs` 在置空前留下 —— 它们**不在**
+        observation 里（那里的 low_dim_state 只有 4 维，与训练一致）。
+        """
+        self.t += 1
+        self.used += 1
+        flip = (self.prev_gripper is not None and gripper_open is not None
+                and abs(float(gripper_open) - float(self.prev_gripper)) > 0.5)
+        if gripper_open is not None:
+            self.prev_gripper = float(gripper_open)
+        quiet = self._update_motion(robot)
+
+        last0 = len(self.subtasks) - 1
+        # ---- 触发判定（本地规则，零成本）----
+        # 停滞不再本地强制前进（v2 那样做实测更差），而是**照常问 VLM**，
+        # 但把「已经耗了 N 帧」作为事实塞进 prompt，让它有依据换个说法。
+        stalled = self.used > STALL_LIMIT
+        at_last = self.idx >= last0
+        why = ""
+        if flip and not at_last:
+            why = "gripper_flip"
+        elif stalled:
+            why = "stall"
+        elif quiet:
+            why = "quiet"                            # 关节速度≈0 或末端没动
+        elif self.t - self.last_ask >= self._heartbeat and not at_last:
+            why = "heartbeat"
+        # 🔴 已在末段时只保留停滞/静止两条触发。实测末段后仍每 3 帧问一次，
+        #    连判 4 次 NEXT（已经无处可去），理由还自相矛盾 ——
+        #    纯粹浪费调用。停滞/静止仍要问，因为那时可能需要 RETRY/REPLAN。
+        if not why:
+            return                                   # 不触发就沿用当前段
+        n_calls = self.stats["plan_call"] + self.stats["monitor_call"]
+        if n_calls >= MAX_CALLS:
+            self.stats["budget_exhausted"] += 1
+            return
+        if not frame:
+            raise PlannerError("vlm-plan 触发了进度判定但拿不到相机图像。")
+        self.stats[f"trigger_{why.replace('gripper_flip','flip')}"] = \
+            self.stats.get(f"trigger_{why.replace('gripper_flip','flip')}", 0) + 1
+        self.last_ask = self.t
+
+        d, tgt, reason = self._monitor(gripper_open, frame,
+                                       stalled=stalled, quiet=quiet)
+        self.stats[d] = self.stats.get(d, 0) + 1
+        self.decisions.append({"t": self.t, "trigger": why, "decision": d,
+                               "idx": self.idx, "target": tgt, "reason": reason})
+        self._apply(d, frame, tgt)
+
+    def _update_motion(self, robot) -> str:
+        """→ 静止的原因（"joint_velocity" / "pose" / ""）。
+
+        连续 QUIET_FRAMES 帧命中才算数：单帧速度为零很可能只是运动规划的
+        间隙，不代表卡住。
+        """
+        if not robot:
+            self.stats["no_robot_state"] += 1
+            return ""
+        pose = robot.get("gripper_pose")
+        xyz = (tuple(float(x) for x in pose[:3])
+               if pose is not None and len(pose) >= 3 else None)
+        prev, self.prev_pose = self.prev_pose, xyz if xyz else self.prev_pose
+
+        # 🔴 关节在动就一票否决。否则会出现「关节速度 0.5 rad/s 但末端位姿
+        #    两帧相同」也被判成静止的情形（单测抓到过）—— 那多半是位姿采样
+        #    的时序问题，不是机械臂停了。物理上「停了」必须是关节先停。
+        v = robot.get("joint_velocities")
+        if v is not None and len(v):
+            vmax = max(abs(float(x)) for x in v)
+            if vmax >= VEL_EPS:
+                self.quiet = 0
+                return ""
+            why = "joint_velocity"
+        else:
+            why = ""
+
+        if xyz is not None and prev is not None:
+            d = sum((a - b) ** 2 for a, b in zip(xyz, prev)) ** 0.5
+            if d < POSE_EPS:
+                why = why or "pose"
+            else:
+                why = ""                             # 末端明显移动了，不算静止
+        self.quiet = self.quiet + 1 if why else 0
+        return why if self.quiet >= QUIET_FRAMES else ""
+
+    # ---------------------------------------------------------- 决策落地
+    def _apply(self, d: str, frame, target: int | None = None) -> None:
+        last = len(self.subtasks) - 1
+        if d == "NEXT":
+            if self.idx < last:
+                # 允许一次跨多段（上限 MAX_ADVANCE）。v1 每次只能进 1 段，
+                # 6 段计划需要 ≥24 个关键帧才走得完，而 episode 只有 26 步 ——
+                # 实测 reach_and_drag 15 步只走到第 3 段，从没碰到关键的 slide。
+                nxt = self.idx + 1 if target is None else int(target)
+                nxt = min(max(nxt, self.idx + 1), min(self.idx + MAX_ADVANCE, last))
+                self.done.extend(self.subtasks[self.idx:nxt])
+                self.idx = nxt
+                self.used = 0
+                self.retry = 0
+                self.code_epoch += 1
+        elif d == "RETRY":
+            # 🔴 RETRY 允许**回退**。实测轨迹里 VLM 连判 10 次
+            #    “grasp failed, lid is on table”，判断完全正确，但索引单调不减，
+            #    指令一直停在「搬运/放置」，而盖子根本没抓住 —— RETRY 变成死胡同，
+            #    重试超限后反而往前推，正好是反的。
+            #    现在 VLM 可以用 index 指定「退回第几步重做」。
+            self.retry += 1
+            self.code_epoch += 1
+            if target is not None:
+                back = min(max(int(target), 0), self.idx)
+                if back < self.idx:
+                    # 回退时把 done 里对应的段撤掉 —— 它们并没有真的完成
+                    del self.done[back:]
+                    self.idx = back
+                    self.used = 0
+                    self.retry = 0
+                    return
+            if self.retry > MAX_RETRY and self.idx < last:
+                self.idx += 1                       # 原地重试太多次就放弃这一段
+                self.used = 0
+                self.retry = 0
+        elif d == "REPLAN":
+            if self.n_replan >= MAX_REPLAN:
+                # 预算用完后再判 REPLAN 就按 CONTINUE 处理并计数。
+                # 实测见过一局里连判 6 次 REPLAN（模型一直走向错的物体），
+                # 后 4 次全被挡下但白花了调用 —— 这里显式记账，便于事后看清。
+                self.stats["replan_blocked"] = self.stats.get("replan_blocked", 0) + 1
+                return
+            self.n_replan += 1
+            # 🔴 **不**把走过的段记成「已完成」。实测：grasp 明明失败了
+            #    （VLM 自己都说 “lid is on table, not held”），但 idx 已经推到 5，
+            #    于是 done 告诉 VLM「approach/grasp/lift/transfer/place 都做完了」，
+            #    它就只规划了一步 “rotate” —— 计划直接废掉。
+            #    画面才是真相：REPLAN 时让 VLM 从它**看到的场景**重新规划全部剩余动作。
+            self.done = []
+            self.subtasks = self._plan(frame)
+            self.idx = 0
+            self.used = 0
+            self.retry = 0
+            self.code_epoch += 1
+        # CONTINUE：什么都不做
+
+    # ---------------------------------------------------------- VLM 调用
+    def _images(self, frame: dict) -> list[tuple[str, str]]:
+        from planner.client import image_data_url_from_array
+        out = []
+        for v in self._views:
+            a = frame.get(v)
+            if a is not None:
+                out.append((v, image_data_url_from_array(a, self._img_size)))
+        if not out:
+            raise PlannerError("observation 里没有可用的相机图像")
+        return out
+
+    def _plan(self, frame: dict) -> list[dict]:
+        from planner.prompts import (build_plan_system_prompt,
+                                     build_plan_user_content)
+        from planner.contract import use_codebook, normalize_instruction
+        msgs = [{"role": "system", "content": build_plan_system_prompt()},
+                {"role": "user", "content": build_plan_user_content(
+                    self.task, self.task_instruction, self._images(frame),
+                    done=self.done or None, prior=self._prior,
+                    n_repeat=self._n_repeat, phrasings=self._phrasings)}]
+        self.stats["plan_call"] += 1
+        try:
+            raw = _parse_plan(self._client.chat(msgs)["content"])
+        except Exception as e:
+            self.stats["fail"] += 1
+            raise PlannerError(f"vlm-plan 规划失败（{type(e).__name__}: {e}）。"
+                               f"本局评测中止。") from e
+        plan = []
+        for st in raw:
+            ins = normalize_instruction(st["instruction"])
+            plan.append({"action": st["action"], "instruction": ins,
+                         "use_codebook": bool(use_codebook(st["action"])),
+                         "k_global": -1, "k_detail": [-1] * 9,  # 必须由 Adapter 出
+                         "n_keyframes": 1})
+        if not plan:
+            raise PlannerError("vlm-plan 生成了空计划")
+        self.decisions.append({"t": self.t, "decision": "PLAN",
+                               "plan": [f"{s['action']}: {s['instruction']}"
+                                        for s in plan]})
+        return plan
+
+    def _monitor(self, gripper_open, frame: dict, stalled: bool = False,
+                 quiet: str = "") -> tuple[str, int | None, str]:
+        from planner.prompts import (build_monitor_system_prompt,
+                                     build_monitor_user_content)
+        msgs = [{"role": "system", "content": build_monitor_system_prompt()},
+                {"role": "user", "content": build_monitor_user_content(
+                    self.task, self.task_instruction, self.subtasks, self.idx,
+                    self.used, gripper_open, self._images(frame),
+                    stalled=stalled, quiet=quiet)}]
+        self.stats["monitor_call"] += 1
+        try:
+            out = self._client.chat(msgs)
+            return _parse_decision(out["content"])
+        except Exception as e:
+            self.stats["fail"] += 1
+            raise PlannerError(f"vlm-plan 进度判定失败（{type(e).__name__}: {e}）。"
+                               f"本局评测中止。") from e
+
+
+def _parse_plan(text: str) -> list[dict]:
+    """与 tools/plan_audit.py 同款容错解析（那边已实测 120/120 成功）。"""
+    s = re.sub(r"^```(?:json)?|```$", "", (text or "").strip(), flags=re.M).strip()
+    try:
+        d = json.loads(s)
+    except Exception:
+        d = None
+        for m in reversed(list(re.finditer(r"\{", s))):
+            try:
+                d = json.loads(s[m.start():s.rfind("}") + 1])
+                break
+            except Exception:
+                continue
+        if d is None:
+            raise PlannerError(f"计划输出里找不到 JSON: {s[:120]!r}")
+    plan = d["plan"] if isinstance(d, dict) else d
+    return [{"action": str(x["action"]).strip(),
+             "instruction": str(x["instruction"]).strip()} for x in plan]
+
+
+_DECISIONS = ("CONTINUE", "NEXT", "RETRY", "REPLAN")
+
+
+def _parse_decision(text: str) -> tuple[str, int | None, str]:
+    """→ (decision, target_index or None, reason)。
+
+    `index` 让 VLM 判 NEXT 时直接说「现在应该在第几步」，可以一次跨多段 ——
+    v1 每次只能进 1 段，长计划在 episode 结束前走不完（见 `_apply`）。
+    """
+    s = re.sub(r"^```(?:json)?|```$", "", (text or "").strip(), flags=re.M).strip()
+    try:
+        d = json.loads(s)
+        v = str(d["decision"]).strip().upper()
+        if v in _DECISIONS:
+            tgt = d.get("index", None)
+            return v, (int(tgt) if tgt is not None else None), str(d.get("reason", ""))[:60]
+    except Exception:
+        pass
+    up = s.upper()
+    # 顺序有意：REPLAN/RETRY 比 CONTINUE 罕见，先匹配它们避免被子串吞掉
+    for v in ("REPLAN", "RETRY", "NEXT", "CONTINUE"):
+        if v in up:
+            return v, None, "(parsed from raw text)"
+    raise PlannerError(f"无法从输出解析 decision: {s[:120]!r}")
+
+
+class OnlinePlanFactory:
+    """`vlm-plan` 的工厂。**不读模板库** —— 只需任务名、整任务指令与 CSV 先验。
+
+    模块级类 + 延迟加载，理由同 `VLMPlanFactory`（spawn 子进程要 pickle）。
+    """
+
+    kind = "vlm-plan"
+
+    def __init__(self, split: str, model: str | None = None,
+                 views=DEFAULT_VIEWS, verbose: bool = True) -> None:
+        self.split = split
+        self.model = model or os.environ.get("AAVLA_ONLINE_PLANNER_MODEL",
+                                             "qwen3.8-max")
+        self.views = tuple(views)
+        self._verbose = verbose
+        self._client = None
+        self._priors = None
+        self._phr = None
+        if not os.environ.get("DASHSCOPE_API_KEY"):
+            raise PlannerError(
+                "vlm-plan 需要 DASHSCOPE_API_KEY / DASHSCOPE_BASE_URL。"
+                "先 source run/env.sh")
+        self.priors                                  # 父进程尽早失败
+
+    @property
+    def priors(self):
+        if self._priors is None:
+            from planner.offline import load_priors
+            self._priors = load_priors()
+            if self._verbose:
+                print(f"[planner] kind=vlm-plan model={self.model} "
+                      f"views={','.join(self.views)}；"
+                      f"CSV 先验 {len(self._priors)} 个任务（仅作参考）",
+                      flush=True)
+        return self._priors
+
+    @property
+    def client(self):
+        if self._client is None:
+            from planner.client import PlannerClient
+            # response_format=json_object：PLAN 是开放式生成，不强制的话模型会
+            # 先写几百 token 散文再给答案（实测 3/4 次因此解析失败）。
+            self._client = PlannerClient(
+                model=self.model, max_tokens=2048,
+                extra_body={"enable_thinking": False,
+                            "response_format": {"type": "json_object"}})
+        return self._client
+
+    def __getstate__(self) -> dict:
+        d = dict(self.__dict__)
+        d["_client"] = None                          # 持有 socket
+        d["_priors"] = None
+        d["_phr"] = None                             # 子进程各自重建
+        return d
+
+    def __call__(self, task: str, episode: int):
+        from stage3.online_planner import (episode_descriptions,
+                                           episode_variation)
+        from planner.contract import expand_prior, n_repeat_prior
+        d = episode_descriptions(task, self.split, episode)
+        var = episode_variation(task, self.split, episode)
+        prior = (expand_prior(task, var, self.priors.get(task, []))
+                 if var is not None else self.priors.get(task, []))
+        nrep = n_repeat_prior(task, var) if var is not None else None
+        return OnlineVLMPlanner(
+            task, d[0] if d else task.replace("_", " "), self.client,
+            prior=prior, n_repeat=nrep,
+            phrasings=self.phrasings(task, var), views=self.views)
+
+    def phrasings(self, task: str, variation: int | None) -> list[str]:
+        """该 (task, variation) 在 train cache 里出现过的全部子任务指令。
+
+        实测每个 (task, variation) 中位只有 15 条、p90 29 条，塞进 prompt 毫无压力。
+        找不到该 variation 时退回该任务的全部指令（更宽但仍在分布内）。
+        """
+        if self._phr is None:
+            self._phr = _load_phrasings(self.split)
+        d = self._phr.get(task, {})
+        got = d.get(str(variation)) if variation is not None else None
+        if got:
+            return got
+        allp = sorted({x for v in d.values() for x in v})
+        return allp[:40]                     # 兜底时截断，避免 prompt 过长
+
+    def summary(self) -> str:
+        return f"OnlineVLM({self.model})，无模板库"
+
+
+#: `(task, variation) -> 训练指令清单` 的进程内缓存。
+#: 每个评测分片是独立进程，各自建一次；扫 12 个任务 × 100 局约 1 秒。
+_PHRASINGS_CACHE: dict[str, dict] = {}
+
+
+def _load_phrasings(split: str) -> dict:
+    """从 train cache 汇总每个 `(task, variation)` 见过的子任务指令。
+
+    🔴 为什么必须用 **train** 而不是当前 split：这些指令是**控制器训练时**
+    见过的原文，目的就是让在线生成的指令落回训练分布。实测在线规划的指令
+    只有 56.6% 命中训练分布（模板法 100%），是 vlm-plan 落后的主因之一。
+
+    格式：`{task: {variation_str: ["action: instruction", ...]}}`
+    """
+    key = "train"                         # 永远取 train，与 split 无关
+    hit = _PHRASINGS_CACHE.get(key)
+    if hit is not None:
+        return hit
+    import collections
+    from stage3.cache_join import PlannerCache
+    root = REPO_ROOT / "aavla_data" / "planner_cache" / "train"
+    out: dict = collections.defaultdict(lambda: collections.defaultdict(set))
+    try:
+        cache = PlannerCache(root)
+        for task in cache.tasks():
+            for e in range(100):
+                ep = cache.get(task, "train", e)
+                if not ep:
+                    continue
+                v = str(int(ep["variation"]))
+                for sg in ep["segments"]:
+                    out[task][v].add(f"{sg['action']}: {sg['instruction']}")
+    except Exception as exc:              # cache 缺失不该让评测崩掉
+        print(f"[planner] 训练指令清单加载失败（{type(exc).__name__}: {exc}），"
+              f"本轮不给候选清单", flush=True)
+    doc = {t: {v: sorted(xs) for v, xs in d.items()} for t, d in out.items()}
+    _PHRASINGS_CACHE[key] = doc
+    return doc

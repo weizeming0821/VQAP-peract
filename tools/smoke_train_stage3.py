@@ -38,7 +38,7 @@ from stage3.cache_join import PlannerCache, TextEmbedCache      # noqa: E402
 def build_cfg(arm: str, batch: int, lr: float) -> OmegaConf:
     cfg = OmegaConf.create({
         "rlbench": {
-            "demo_path": str(REPO_ROOT / "data_rlbench" / "train"),
+            "demo_path": str(REPO_ROOT / "aavla_data/rlbench" / "train"),
             "episode_length": 25,
             "cameras": ["front", "left_shoulder", "right_shoulder", "wrist"],
             "camera_resolution": [128, 128],

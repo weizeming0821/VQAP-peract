@@ -108,6 +108,53 @@ def main() -> int:
     check("缺码时抛 RuntimeError 而非静默跳过",
           "raise RuntimeError" in src and "codebook" in src.lower())
 
+    print("=== 2b. B2/B3 缺子任务指令时必须硬失败（P0-3，运行时验证）===")
+    # act() 的语言输入只有 observation['lang_goal_tokens']，而它由
+    # yarr/envs/rlbench_env.py:141 从 self._lang_goal（**整任务指令**）生成。
+    # B2/B3 是用子任务指令训的，评测时若拿整任务指令，跑出来就是「挂着 B2/B3
+    # 名字的 B1 成绩」——不报错、不告警。与 BUG 1 同类，同样必须硬失败。
+    #
+    # 防线在 act() 的最前面（只碰 self._coordinate_bounds 与 observation.get），
+    # 所以不需要 build 一个完整 agent，绕过 __init__ 装两个属性即可触发。
+    def bare_agent(arm):
+        a = QAttentionPerActBCAgent.__new__(QAttentionPerActBCAgent)
+        a._coordinate_bounds = torch.tensor([[-0.3, -0.5, 0.6, 0.7, 0.5, 1.6]])
+        a._stage3_arm = arm
+        return a
+
+    for arm in ("B2", "B3"):
+        try:
+            bare_agent(arm).act(0, {"lang_goal_tokens": torch.zeros(1, 1, 77)})
+            check(f"{arm} 只给整任务指令 -> 应抛 RuntimeError", False, "没有抛异常")
+        except RuntimeError as exc:
+            ok = "subtask_lang_goal_tokens" in str(exc)
+            check(f"{arm} 只给整任务指令 -> 抛 RuntimeError", ok, str(exc)[:100])
+        except Exception as exc:
+            check(f"{arm} 只给整任务指令 -> 抛 RuntimeError", False,
+                  f"抛的是 {type(exc).__name__}")
+
+    # 给了子任务指令就应当放行（放行后会因为 agent 没 build 而挂在别处，
+    # 只要**不是**那条 RuntimeError 就说明防线正确地让路了）
+    try:
+        bare_agent("B2").act(0, {"lang_goal_tokens": torch.zeros(1, 1, 77),
+                                 "subtask_lang_goal_tokens": torch.zeros(1, 1, 77)})
+        passed = True
+    except RuntimeError as exc:
+        passed = "subtask_lang_goal_tokens" not in str(exc)
+    except Exception:
+        passed = True
+    check("B2 给了子任务指令 -> 防线放行", passed)
+
+    # B1 用整任务指令，防线不该拦它
+    try:
+        bare_agent("B1").act(0, {"lang_goal_tokens": torch.zeros(1, 1, 77)})
+        passed = True
+    except RuntimeError as exc:
+        passed = "subtask_lang_goal_tokens" not in str(exc)
+    except Exception:
+        passed = True
+    check("B1 用整任务指令 -> 防线不拦", passed)
+
     print("=== 3. B1（无码本）不受影响 ===")
     net_b1 = build_net(with_injector=False, device=dev)
     with torch.no_grad():

@@ -22,7 +22,7 @@ from typing import Any
 from PIL import Image
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_CACHE_DIR = REPO_ROOT / "planner_cache" / "llm_responses"
+DEFAULT_CACHE_DIR = REPO_ROOT / "aavla_data" / "planner_cache" / "llm_responses"
 
 
 class PlannerClient:
@@ -30,7 +30,8 @@ class PlannerClient:
                  cache_dir: Path | str = DEFAULT_CACHE_DIR,
                  temperature: float = 0.0, max_tokens: int = 8000,
                  max_retries: int = 4, min_interval: float = 0.0,
-                 timeout: float = 300.0) -> None:
+                 timeout: float = 300.0,
+                 extra_body: dict | None = None) -> None:
         from openai import OpenAI
         api_key = os.environ.get("DASHSCOPE_API_KEY")
         base_url = os.environ.get("DASHSCOPE_BASE_URL")
@@ -43,6 +44,11 @@ class PlannerClient:
         self.max_tokens = max_tokens
         self.max_retries = max_retries
         self.min_interval = min_interval
+        # 传给服务端的额外参数。在线 Planner 用它关掉思考链：
+        # qwen3.8-max 默认会输出几百到三千个思考 token，延迟正比于此
+        # （实测 5.9s / 220 token vs 关掉后 0.9s / 25 token，快 6.5 倍）。
+        # 离线建 cache 需要长推理，所以默认为 None，行为不变。
+        self.extra_body = extra_body or None
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
@@ -52,8 +58,12 @@ class PlannerClient:
 
     # ------------------------------------------------------------ 记忆化
     @staticmethod
-    def _key(model: str, messages: list[dict]) -> str:
-        blob = json.dumps({"model": model, "messages": messages},
+    def _key(model: str, messages: list[dict], extra: dict | None = None) -> str:
+        # extra 为空时不进 key —— 保持与已有的离线缓存逐位兼容。
+        payload = {"model": model, "messages": messages}
+        if extra:
+            payload["extra_body"] = extra
+        blob = json.dumps(payload,
                           sort_keys=True, ensure_ascii=False).encode()
         return hashlib.sha256(blob).hexdigest()
 
@@ -65,7 +75,7 @@ class PlannerClient:
     # ------------------------------------------------------------ 调用
     def chat(self, messages: list[dict], model: str | None = None) -> dict[str, Any]:
         model = model or self.model
-        key = self._key(model, messages)
+        key = self._key(model, messages, self.extra_body)
         path = self._cache_path(key)
         if path.is_file():
             with self._lock:
@@ -84,7 +94,8 @@ class PlannerClient:
                 t0 = time.time()
                 r = self._client.chat.completions.create(
                     model=model, messages=messages,
-                    temperature=self.temperature, max_tokens=self.max_tokens)
+                    temperature=self.temperature, max_tokens=self.max_tokens,
+                    **({"extra_body": self.extra_body} if self.extra_body else {}))
                 out = {"model": model, "content": r.choices[0].message.content,
                        "prompt_tokens": r.usage.prompt_tokens,
                        "completion_tokens": r.usage.completion_tokens,
@@ -130,3 +141,27 @@ def image_data_url(path: str | Path, size: int = 224, quality: int = 88) -> str:
         if len(_IMG_CACHE) < 20000:
             _IMG_CACHE[ck] = url
     return url
+
+
+def image_data_url_from_array(arr, size: int = 224, quality: int = 88) -> str:
+    """内存里的图像数组 → data URL。在线 Planner 用。
+
+    离线建 cache 时图像是磁盘上的 png，可以按路径记忆化；在线评测时图像来自
+    仿真器的 observation，只存在于内存里，所以需要这条不落盘的路径。
+    接受 HWC 或 CHW、uint8 或 [0,1] 浮点。
+    """
+    import numpy as np
+    a = np.asarray(arr)
+    if a.ndim == 3 and a.shape[0] in (1, 3) and a.shape[-1] not in (1, 3):
+        a = np.transpose(a, (1, 2, 0))            # CHW -> HWC
+    if a.dtype != np.uint8:
+        a = (np.clip(a, 0.0, 1.0) * 255).astype(np.uint8) if a.max() <= 1.0 \
+            else np.clip(a, 0, 255).astype(np.uint8)
+    if a.ndim == 2:
+        a = np.stack([a] * 3, -1)
+    im = Image.fromarray(a[..., :3]).convert("RGB")
+    if im.size != (size, size):
+        im = im.resize((size, size), Image.BILINEAR)
+    buf = io.BytesIO()
+    im.save(buf, format="JPEG", quality=quality)
+    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()

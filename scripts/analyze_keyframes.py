@@ -109,7 +109,7 @@ def load_prior(csv_path: Path) -> dict[str, list[str]]:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--root", default=str(REPO_ROOT / "data_rlbench"))
+    ap.add_argument("--root", default=str(REPO_ROOT / "aavla_data/rlbench"))
     ap.add_argument("--splits", nargs="+", default=["train"],
                     choices=["train", "val", "test"])
     ap.add_argument("--tasks", nargs="+", default=PERACT_18)

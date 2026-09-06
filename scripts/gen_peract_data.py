@@ -109,7 +109,7 @@ def build_cmd(root: Path, split: str, task: str, processes: int, image_size: str
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--root", default=str(REPO_ROOT / "data_rlbench"))
+    ap.add_argument("--root", default=str(REPO_ROOT / "aavla_data/rlbench"))
     ap.add_argument("--splits", nargs="+", default=["train", "val", "test"], choices=list(SPLIT_EPISODES))
     ap.add_argument("--tasks", nargs="+", default=PERACT_18)
     ap.add_argument("--concurrent-tasks", type=int, default=30,

@@ -16,7 +16,7 @@
 
 用法：
     source run/env.sh
-    python tools/verify_cache_replay_join.py --cache-dir planner_cache/train --tasks close_jar
+    python tools/verify_cache_replay_join.py --cache-dir aavla_data/planner_cache/train --tasks close_jar
 """
 
 from __future__ import annotations
@@ -43,8 +43,8 @@ DEMO_AUG_EVERY_N = 10       # PerAct 默认值，三臂一致
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--cache-dir", default=str(REPO_ROOT / "planner_cache" / "train"))
-    ap.add_argument("--data-root", default=str(REPO_ROOT / "data_rlbench"))
+    ap.add_argument("--cache-dir", default=str(REPO_ROOT / "aavla_data" / "planner_cache" / "train"))
+    ap.add_argument("--data-root", default=str(REPO_ROOT / "aavla_data/rlbench"))
     ap.add_argument("--split", default="train")
     ap.add_argument("--tasks", nargs="+", default=None, help="默认全部")
     ap.add_argument("--expect-episodes", type=int, default=None,

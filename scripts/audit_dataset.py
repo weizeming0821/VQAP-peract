@@ -2,7 +2,7 @@
 """RLBench 数据集完整性与纯净性审计。
 
 按 `VLA_Design §2.5` 的「防泄漏硬约束」精神，任何「多套数据共存、按配置选用」的结构
-都必须有硬校验。本脚本对生成好的 `data_rlbench/` 做六项检查，任一项失败即报错退出。
+都必须有硬校验。本脚本对生成好的 `aavla_data/rlbench/` 做六项检查，任一项失败即报错退出。
 
 用法：
     source run/env.sh
@@ -138,10 +138,10 @@ def audit(root: Path, splits: list[str], tasks: list[str]) -> tuple[list[str], d
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--root", default=str(REPO_ROOT / "data_rlbench"))
+    ap.add_argument("--root", default=str(REPO_ROOT / "aavla_data/rlbench"))
     ap.add_argument("--splits", nargs="+", default=["train", "val", "test"])
     ap.add_argument("--tasks", nargs="+", default=PERACT_18)
-    ap.add_argument("--out", default=str(REPO_ROOT / "data_rlbench" / "audit_report.json"))
+    ap.add_argument("--out", default=str(REPO_ROOT / "aavla_data/rlbench" / "audit_report.json"))
     args = ap.parse_args()
 
     errors, stats = audit(Path(args.root), args.splits, args.tasks)

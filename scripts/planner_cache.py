@@ -12,7 +12,7 @@
 典型用法
     source run/env.sh
     python scripts/planner_cache.py all --episodes 100 --concurrent 8
-    python scripts/planner_cache.py build --tasks close_jar --episodes 5 --out-dir planner_cache/_try
+    python scripts/planner_cache.py build --tasks close_jar --episodes 5 --out-dir aavla_data/planner_cache/_try
 
 抗中断设计
   * 每个 (task) 完成即写分片，不等全量跑完；
@@ -428,8 +428,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", choices=["build", "repair", "backfill", "codes", "gates", "all"])
-    ap.add_argument("--data-root", default=str(REPO_ROOT / "data_rlbench"))
-    ap.add_argument("--cache-dir", default=str(REPO_ROOT / "planner_cache" / "train"))
+    ap.add_argument("--data-root", default=str(REPO_ROOT / "aavla_data/rlbench"))
+    ap.add_argument("--cache-dir", default=str(REPO_ROOT / "aavla_data" / "planner_cache" / "train"))
     ap.add_argument("--out-dir", default=None, help="build 的输出目录，默认同 --cache-dir")
     ap.add_argument("--split", default="train")
     ap.add_argument("--tasks", nargs="+", default=PERACT_18)
