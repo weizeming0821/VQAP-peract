@@ -1,11 +1,15 @@
 # ---- 大体量数据与产物（不入版本控制）----
 AtomAction_Dataset/
-data_rlbench/
+aavla_data/
 checkpoints/
-planner_cache/
 tensorboard/
 log/
 result/
+
+# tools/ **不**整体忽略：里面全是代码（单测、门禁、看门狗、诊断脚本），
+# 是实验可复现的一部分。曾经这里写过 `tools/`，但当时已有 13 个 tools 文件
+# 被 `git add -f` 跟踪着 —— 一半跟踪一半忽略，新增的工具默认落在版本控制外，
+# 出事就找不回来。产物类的 __pycache__ 由文件末尾的全局规则覆盖。
 
 # ---- 第三方源码：各自有独立 .git，改动在其自身历史里追溯 ----
 #      source/peract  · source/RLBench · source/YARR 均含上游 commit 历史，

@@ -22,8 +22,8 @@ FIELDS = {"front_rgb","low_dim_state","trans_action_indicies","gripper_pose",
           "subtask_index","subtask_action"}
 SAMPLE = {k: k for k in FIELDS}
 
-print("=== 1. 四臂白名单 ===")
-for arm in ("B0","B1","B2","B3"):
+print("=== 1. 各臂白名单 ===")
+for arm in ARMS:
     a = allowed_fields(arm, FIELDS)
     print(f"       {arm}: {len(a)} 个字段")
 check("B1 拿不到任何 subtask_*", not any(f.startswith("subtask_") for f in allowed_fields("B1", FIELDS)))
@@ -31,6 +31,24 @@ check("B2 拿不到整任务语言字段", "lang_goal_emb" not in allowed_fields
 check("B2 拿得到子任务语言字段", "subtask_lang_goal_emb" in allowed_fields("B2", FIELDS))
 check("B2 拿不到码字段", "subtask_k_global" not in allowed_fields("B2", FIELDS))
 check("B3 拿得到码字段", "subtask_k_global" in allowed_fields("B3", FIELDS))
+# ---- B4：= B3 的字段权限，只换注入层。字段权限若不相等，B4−B3 的差就不干净了 ----
+check("B4 拿得到码字段", "subtask_k_global" in allowed_fields("B4", FIELDS))
+check("B4 与 B3 字段权限逐字段相同",
+      allowed_fields("B4", FIELDS) == allowed_fields("B3", FIELDS),
+      f'B4={sorted(allowed_fields("B4", FIELDS))} B3={sorted(allowed_fields("B3", FIELDS))}')
+
+print("=== 1b. 注入层版本：臂是唯一真源 ===")
+check("B3.injector == v1", ARMS["B3"].injector == "v1", ARMS["B3"].injector)
+check("B4.injector == v2", ARMS["B4"].injector == "v2", ARMS["B4"].injector)
+check("不启用码的臂 codes=False", not any(ARMS[a].codes for a in ("B0","B1","B2")))
+check("B0 不参与训练（do_freeze 靠它判）", ARMS["B0"].train is False)
+check("B1/B2/B3/B4 都参与训练", all(ARMS[a].train for a in ("B1","B2","B3","B4")))
+try:
+    from stage3.arms import Arm
+    Arm("BX", "subtask", True, True, "", "", injector="v3")
+    check("非法 injector 必须抛异常", False)
+except ValueError:
+    check("非法 injector 必须抛异常", True)
 check("四臂都拿得到观测字段", all("front_rgb" in allowed_fields(a, FIELDS) for a in ARMS))
 
 print("=== 2. 越权访问抛异常 ===")
@@ -50,6 +68,7 @@ check("B3 读 front_rgb", GuardedSample(SAMPLE,"B3")["front_rgb"] == "front_rgb"
 print("=== 4. lang_fields_for ===")
 check("B0/B1 -> 整任务字段", lang_fields_for("B1") == ("lang_goal_emb","lang_token_embs"))
 check("B2/B3 -> 子任务字段", lang_fields_for("B3") == ("subtask_lang_goal_emb","subtask_lang_token_embs"))
+check("B4 -> 子任务字段", lang_fields_for("B4") == ("subtask_lang_goal_emb","subtask_lang_token_embs"))
 
 print("=== 5. PlannerCache 真实数据 ===")
 try:

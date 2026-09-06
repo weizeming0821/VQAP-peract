@@ -38,11 +38,30 @@ def sha256(p: Path) -> str:
     return h.hexdigest()
 
 
+def _default_logdir() -> str:
+    """训练配置里的 framework.logdir —— 权重必须装进它，否则训练找不到。"""
+    conf = REPO_ROOT / "source" / "peract" / "conf" / "stage3.yaml"
+    try:
+        import yaml
+        d = yaml.safe_load(conf.read_text())
+        v = d["framework"]["logdir"]
+        if v:
+            return str(v)
+    except Exception as exc:                      # 配置读不到就退回约定路径
+        print(f"  ⚠️ 未能从 {conf} 读出 framework.logdir（{exc}），"
+              f"退回默认 checkpoints/stage3_main", file=sys.stderr)
+    return str(REPO_ROOT / "checkpoints" / "stage3_main")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--arm", action="append", required=True,
                     help="可重复，如 --arm B1 --arm B3")
-    ap.add_argument("--logdir", default=str(REPO_ROOT / "logs" / "stage3"))
+    # 🔴 默认值直接从 conf/stage3.yaml 的 framework.logdir 读，不写死。
+    #    原来写死成 REPO_ROOT/"logs"/"stage3" —— 与训练真正使用的
+    #    checkpoints/stage3_main 不是同一个地方，漏传 --logdir 就会把权重
+    #    装到一个没人读的目录里，然后训练从随机初始化起步且**不报错**。
+    ap.add_argument("--logdir", default=_default_logdir())
     ap.add_argument("--official", default=str(OFFICIAL))
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--force", action="store_true")

@@ -1,0 +1,1285 @@
+diff --git a/agents/arm/launch_utils.py b/agents/arm/launch_utils.py
+index ba4ff86..ee78e1e 100644
+--- a/agents/arm/launch_utils.py
++++ b/agents/arm/launch_utils.py
+@@ -45,7 +45,7 @@ def create_replay(batch_size: int, timesteps: int, prioritisation: bool,
+         reward_dtype=np.float32,
+         update_horizon=1,
+         observation_elements=observation_elements,
+-        extra_replay_elements=[ReplayElement('demo', (), np.bool)]
++        extra_replay_elements=[ReplayElement('demo', (), bool)]
+     )
+     return replay_buffer
+ 
+diff --git a/agents/baselines/bc_lang/launch_utils.py b/agents/baselines/bc_lang/launch_utils.py
+index f895c24..fedd941 100644
+--- a/agents/baselines/bc_lang/launch_utils.py
++++ b/agents/baselines/bc_lang/launch_utils.py
+@@ -64,7 +64,7 @@ def create_replay(batch_size: int, timesteps: int,
+     ])
+ 
+     extra_replay_elements = [
+-        ReplayElement('demo', (), np.bool),
++        ReplayElement('demo', (), bool),
+     ]
+ 
+     replay_buffer = TaskUniformReplayBuffer(
+diff --git a/agents/baselines/vit_bc_lang/launch_utils.py b/agents/baselines/vit_bc_lang/launch_utils.py
+index 6c931c4..3ab09e3 100644
+--- a/agents/baselines/vit_bc_lang/launch_utils.py
++++ b/agents/baselines/vit_bc_lang/launch_utils.py
+@@ -64,7 +64,7 @@ def create_replay(batch_size: int, timesteps: int,
+     ])
+ 
+     extra_replay_elements = [
+-        ReplayElement('demo', (), np.bool),
++        ReplayElement('demo', (), bool),
+     ]
+ 
+     replay_buffer = TaskUniformReplayBuffer(
+diff --git a/agents/c2farm_lingunet_bc/launch_utils.py b/agents/c2farm_lingunet_bc/launch_utils.py
+index ce54a5f..a406c9a 100644
+--- a/agents/c2farm_lingunet_bc/launch_utils.py
++++ b/agents/c2farm_lingunet_bc/launch_utils.py
+@@ -92,7 +92,7 @@ def create_replay(batch_size: int, timesteps: int,
+         )
+ 
+     extra_replay_elements = [
+-        ReplayElement('demo', (), np.bool),
++        ReplayElement('demo', (), bool),
+     ]
+ 
+     replay_buffer = TaskUniformReplayBuffer(
+diff --git a/agents/peract_bc/launch_utils.py b/agents/peract_bc/launch_utils.py
+index 98ac622..75378e6 100644
+--- a/agents/peract_bc/launch_utils.py
++++ b/agents/peract_bc/launch_utils.py
+@@ -3,6 +3,7 @@
+ # License: https://github.com/stepjam/ARM/LICENSE
+ 
+ import logging
++import os
+ from typing import List
+ 
+ import numpy as np
+@@ -38,7 +39,8 @@ def create_replay(batch_size: int, timesteps: int,
+                   save_dir: str, cameras: list,
+                   voxel_sizes,
+                   image_size=[128, 128],
+-                  replay_size=3e5):
++                  replay_size=3e5,
++                  stage3_subtask_fields: bool = False):
+ 
+     trans_indicies_size = 3 * len(voxel_sizes)
+     rot_and_grip_indicies_size = (3 + 1)
+@@ -86,10 +88,31 @@ def create_replay(batch_size: int, timesteps: int,
+     ])
+ 
+     extra_replay_elements = [
+-        ReplayElement('demo', (), np.bool),
++        ReplayElement('demo', (), bool),
+     ]
+ 
++    # ---- Stage 3 子任务字段（VLA_Design §8.6.1）----
++    # 命名规约：一律 subtask_ 前缀。PerAct 原生的 lang_goal_emb / lang_token_embs /
++    # lang_goal 永远承载**整任务**指令，不改名不改义 —— 避免「同名不同义」这类
++    # 最难排查的错误。三臂共享同一份 replay，靠 stage3/arms.py 的字段白名单隔离。
++    if stage3_subtask_fields:
++        observation_elements.extend([
++            ReplayElement('subtask_lang_goal_emb', (lang_feat_dim,),
++                          np.float32),                                    # B2, B3
++            ReplayElement('subtask_lang_token_embs',
++                          (max_token_seq_len, lang_emb_dim,), np.float32),  # B2, B3
++            ReplayElement('subtask_lang_goal', (1,), object),
++            ReplayElement('subtask_k_global', (), np.int32),              # B3
++            ReplayElement('subtask_k_detail', (9,), np.int32),            # B3
++            ReplayElement('subtask_code_mask', (), bool),                 # B3
++            ReplayElement('subtask_index', (), np.int32),                 # 分析
++            ReplayElement('subtask_action', (), str),                     # 分析
++        ])
++
+     replay_buffer = TaskUniformReplayBuffer(
++        # 🔴 YARR 默认 True —— 训练一结束就把整个 replay 删掉（P0 实测）。
++        # 三臂共享同一份 152 GB replay 的前提就是它必须存活。
++        purge_replay_on_shutdown=False,
+         save_dir=save_dir,
+         batch_size=batch_size,
+         timesteps=timesteps,
+@@ -159,7 +182,9 @@ def _add_keypoints_to_replay(
+         crop_augmentation: bool,
+         description: str = '',
+         clip_model = None,
+-        device = 'cpu'):
++        device = 'cpu',
++        cache_ep = None,
++        text_embed_cache = None):
+     prev_action = None
+     obs = inital_obs
+     for k, keypoint in enumerate(episode_keypoints):
+@@ -183,6 +208,25 @@ def _add_keypoints_to_replay(
+         prev_action = np.copy(action)
+ 
+         others = {'demo': True}
++        # ---- Stage 3：把该样本所属的子任务信息写进 subtask_* 字段 ----
++        # 归属规则（VLA_Design §4.3）：样本的子任务 = 其 **target 关键帧**所属的 segment。
++        # keypoint 是绝对帧号；跨边界样本（obs 在 seg_k 末尾、target 是 seg_{k+1} 首帧）
++        # 恰好对应部署时 Planner 刚说完 NEXT 的那一刻，语义正确。
++        # 样本总数与 baseline 完全相同，三臂对比不因样本量差异被污染。
++        if cache_ep is not None:
++            from stage3.cache_join import PlannerCache as _PC
++            seg = _PC.segment_of_keypoint(cache_ep, keypoint)
++            st_emb, st_tok = text_embed_cache(seg['instruction'])
++            others.update({
++                'subtask_lang_goal_emb': st_emb,
++                'subtask_lang_token_embs': st_tok,
++                'subtask_lang_goal': np.array([seg['instruction']], dtype=object),
++                'subtask_k_global': np.int32(seg['k_global']),
++                'subtask_k_detail': np.array(seg['k_detail'], dtype=np.int32),
++                'subtask_code_mask': np.bool_(seg['use_codebook']),
++                'subtask_index': np.int32(seg['segment_index']),
++                'subtask_action': seg['action'],
++            })
+         final_obs = {
+             'trans_action_indicies': trans_indicies,
+             'rot_grip_action_indicies': rot_grip_indicies,
+@@ -206,6 +250,9 @@ def _add_keypoints_to_replay(
+ 
+     obs_dict_tp1.pop('wrist_world_to_cam', None)
+     obs_dict_tp1.update(final_obs)
++    if cache_ep is not None:
++        obs_dict_tp1.update({k: v for k, v in others.items()
++                             if k.startswith('subtask_')})
+     replay.add_final(**obs_dict_tp1)
+ 
+ 
+@@ -225,15 +272,38 @@ def fill_replay(cfg: DictConfig,
+                 crop_augmentation: bool,
+                 clip_model = None,
+                 device = 'cpu',
+-                keypoint_method = 'heuristic'):
++                keypoint_method = 'heuristic',
++                planner_cache_dir = None,
++                data_split = 'train'):
++    """Stage 3 说明：planner_cache_dir 传的是**路径字符串**而非对象。
++
++    fill_multi_task_replay 用 multiprocessing.Process 逐任务 spawn，所有参数必须
++    可 pickle。PlannerCache 虽然只是字典（可 pickle 但要复制 12 份），
++    TextEmbedCache 却持有 CUDA 上的 CLIP 模型 —— **不可 pickle**。
++    所以改为传路径，由每个子进程自己构建，成本只是多解析一次 5.7 MB JSON。
++    """
+     logging.getLogger().setLevel(cfg.framework.logging_level)
+ 
++    planner_cache = text_embed_cache = None
++    if planner_cache_dir is not None:
++        import sys as _sys
++        # 本文件在 <repo>/source/peract/agents/peract_bc/ 下，上溯 4 层到仓库根
++        _root = os.path.abspath(os.path.join(os.path.dirname(__file__),
++                                             os.pardir, os.pardir, os.pardir, os.pardir))
++        if _root not in _sys.path:
++            _sys.path.insert(0, _root)
++        from stage3.cache_join import PlannerCache, TextEmbedCache
++        planner_cache = PlannerCache(planner_cache_dir)
++
+     if clip_model is None:
+         model, _ = load_clip('RN50', jit=False, device=device)
+         clip_model = build_model(model.state_dict())
+         clip_model.to(device)
+         del model
+ 
++    if planner_cache is not None:
++        text_embed_cache = TextEmbedCache(clip_model, device)
++
+     logging.debug('Filling %s replay ...' % task)
+     for d_idx in range(num_demos):
+         # load demo from disk
+@@ -250,6 +320,20 @@ def fill_replay(cfg: DictConfig,
+         # extract keypoints (a.k.a keyframes)
+         episode_keypoints = demo_loading_utils.keypoint_discovery(demo, method=keypoint_method)
+ 
++        # ---- Stage 3：接 Planner cache ----
++        cache_ep = None
++        if planner_cache is not None:
++            cache_ep = planner_cache.get(task, data_split, d_idx)
++            if cache_ep is None:
++                # 该 episode 在建 cache 时被判为不合格（结构错误或夹爪信号异常），
++                # 跳过而非硬报错 —— 实测 1800 条里 8 条，占 0.44%。
++                if rank == 0:
++                    logging.info(f"Skip Demo({d_idx}) - not in planner cache - {task}")
++                continue
++            # A1（VLA_Design §5.1 C5）：cache 的关键帧必须与当前 keypoint_discovery
++            # 逐位相同，不等即抛异常 —— cache 与代码/数据不同源时绝不能继续训练。
++            planner_cache.assert_keypoints(cache_ep, episode_keypoints, task, d_idx)
++
+         if rank == 0:
+             logging.info(f"Loading Demo({d_idx}) - found {len(episode_keypoints)} keypoints - {task}")
+ 
+@@ -270,7 +354,8 @@ def fill_replay(cfg: DictConfig,
+                 cfg, task, replay, obs, demo, episode_keypoints, cameras,
+                 rlbench_scene_bounds, voxel_sizes, bounds_offset,
+                 rotation_resolution, crop_augmentation, description=desc,
+-                clip_model=clip_model, device=device)
++                clip_model=clip_model, device=device,
++                cache_ep=cache_ep, text_embed_cache=text_embed_cache)
+     logging.debug('Replay %s filled with demos.' % task)
+ 
+ 
+@@ -289,7 +374,11 @@ def fill_multi_task_replay(cfg: DictConfig,
+                            rotation_resolution: int,
+                            crop_augmentation: bool,
+                            clip_model = None,
+-                           keypoint_method = 'heuristic'):
++                           keypoint_method = 'heuristic',
++                           planner_cache_dir = None,
++                           data_split = 'train'):
++    # ⚠️ 本函数内部有一个局部变量也叫 split（`for split in split_n` 的索引分片），
++    # 参数必须叫 data_split，否则会被遮蔽成 ndarray。
+     manager = Manager()
+     store = manager.dict()
+ 
+@@ -327,7 +416,9 @@ def fill_multi_task_replay(cfg: DictConfig,
+                                                   crop_augmentation,
+                                                   clip_model,
+                                                   model_device,
+-                                                  keypoint_method))
++                                                  keypoint_method,
++                                                  planner_cache_dir,
++                                                  data_split))
+             p.start()
+             processes.append(p)
+ 
+@@ -336,11 +427,41 @@ def fill_multi_task_replay(cfg: DictConfig,
+ 
+ 
+ def create_agent(cfg: DictConfig):
++    """按实验臂装配 agent。
++
++    stage3 配置（cfg.stage3，缺省时完全等价于原版 PerAct）：
++        arm      stage3/arms.py 里定义的臂名，None -> 不做字段隔离、不冻结、不注入
++        codebook 码本 checkpoint 路径（仅启用码的臂需要）
++
++    🔴 「这个臂要不要码 / 要不要冻结 / 用哪版注入层」一律从 `stage3.arms.ARMS`
++       读，**不在这里写死臂名**。曾经这里是 `use_codes = arm == 'B3'`，于是新增
++       B4 臂时若只往 arms.py 加一条，训练会一路跑完、不报任何错，却训出一个
++       没有码注入、也没冻结主干的四不像 —— 正是本项目反复吃亏的静默出错模式。
++    """
++    stage3 = cfg.get('stage3', None)
++    arm = None if stage3 is None else stage3.get('arm', None)
++    from stage3.arms import ARMS
++    if arm is not None and arm not in ARMS:
++        raise ValueError(
++            f"未知实验臂 {arm!r}；已定义的臂：{sorted(ARMS)}。"
++            f"新增臂请在 stage3/arms.py 里声明，不要在本文件里写死臂名。")
++    use_codes = arm is not None and ARMS[arm].codes
++    do_freeze = arm is not None and ARMS[arm].train
++
+     LATENT_SIZE = 64
+     depth_0bounds = cfg.rlbench.scene_bounds
+     cam_resolution = cfg.rlbench.camera_resolution
+ 
+     num_rotation_classes = int(360. // cfg.method.rotation_resolution)
++
++    # ---- Stage 3：冻结码本（仅启用码的臂：B3 / B4）----
++    codebook = None
++    if use_codes:
++        from model.code_injector import load_codebook
++        codebook = load_codebook(stage3.codebook)
++        logging.info('Stage 3 [%s] 码本已加载: global %d / detail %d'
++                     % (arm, codebook.n_global, codebook.n_detail))
++
+     qattention_agents = []
+     for depth, vox_size in enumerate(cfg.method.voxel_sizes):
+         last = depth == len(cfg.method.voxel_sizes) - 1
+@@ -376,6 +497,41 @@ def create_agent(cfg: DictConfig):
+             final_dim=cfg.method.final_dim,
+         )
+ 
++        # ---- Stage 3：挂载码向量注入层（仅启用码的臂：B3 / B4）----
++        # 注入层输出维度必须等于 latents 的通道数 input_dim_before_seq（= im_channels*2）。
++        if use_codes:
++            # 注入层版本：
++            #   v1  FiLM + 门控 cross-attn（B3 用的那版；两个零初始化张量被
++            #       LAMB 的 ‖Δp‖≡lr·‖p‖ 锁死，实测 100000 步注入幅度只有 0.0095%）
++            #   v2  纯残差相加，无门控无 FiLM（B4；初始注入 16.79%）
++            # 保留 v1 是为了 B3 的既有 checkpoint 仍能加载（两版参数名不同）。
++            #
++            # 🔴 **臂是唯一真源**。cfg.stage3.injector 只作断言用：写了就必须与
++            #    臂声明的一致，不一致直接抛异常。这样启动命令只要 stage3.arm=B4
++            #    就够了，漏传或传错都会当场炸，而不是在 B4/ 目录下静默训出 v1。
++            _inj = ARMS[arm].injector
++            _cfg_inj = stage3.get('injector', None)
++            if _cfg_inj is not None and str(_cfg_inj) != _inj:
++                raise ValueError(
++                    f"{arm} 臂在 stage3/arms.py 里声明注入层 {_inj!r}，"
++                    f"但配置里写的是 stage3.injector={_cfg_inj!r}。"
++                    f"注入层版本以臂为准 —— 要换版本请改臂定义或换臂，"
++                    f"不要在命令行覆盖。")
++            if _inj == 'v2':
++                from model.code_injector import CodeInjectorV2 as _Injector
++            elif _inj == 'v1':
++                from model.code_injector import CodeInjector as _Injector
++            else:
++                raise ValueError(f"注入层版本只能是 v1/v2，收到 {_inj!r}")
++            perceiver_encoder.code_injector = _Injector(
++                dim=perceiver_encoder.input_dim_before_seq,
++                code_dim=int(codebook.global_codebook.shape[1]),
++                n_slots=int(codebook.detail_codebook.shape[0] and 9),
++            )
++            logging.info('Stage 3 注入层已挂载(%s): dim=%d 参数 %s'
++                         % (_inj, perceiver_encoder.input_dim_before_seq,
++                            f'{perceiver_encoder.code_injector.n_trainable():,}'))
++
+         qattention_agent = QAttentionPerActBCAgent(
+             layer=depth,
+             coordinate_bounds=depth_0bounds,
+@@ -405,6 +561,9 @@ def create_agent(cfg: DictConfig):
+             transform_augmentation_rot_resolution=cfg.method.transform_augmentation.aug_rot_resolution,
+             optimizer_type=cfg.method.optimizer,
+             num_devices=cfg.ddp.num_devices,
++            stage3_freeze=do_freeze,
++            stage3_arm=arm,
++            codebook=codebook,
+         )
+         qattention_agents.append(qattention_agent)
+ 
+diff --git a/agents/peract_bc/perceiver_lang_io.py b/agents/peract_bc/perceiver_lang_io.py
+index 5f4aeb5..b5bef77 100644
+--- a/agents/peract_bc/perceiver_lang_io.py
++++ b/agents/peract_bc/perceiver_lang_io.py
+@@ -184,6 +184,9 @@ class PerceiverVoxelLangEncoder(nn.Module):
+         self.num_grip_classes = num_grip_classes
+         self.num_collision_classes = num_collision_classes
+         self.final_dim = final_dim
++        # VQAP 码向量注入层。默认 None —— 前向完全跳过，与原版逐位等价（B0/B1）。
++        # 由 launch_utils.create_agent 按实验臂决定是否挂载（仅 B3）。
++        self.code_injector = None
+         self.input_dropout = input_dropout
+         self.attn_dropout = attn_dropout
+         self.decoder_dropout = decoder_dropout
+@@ -344,6 +347,9 @@ class PerceiverVoxelLangEncoder(nn.Module):
+             bounds,
+             prev_layer_bounds,
+             mask=None,
++            z_g=None,
++            Z_d=None,
++            code_mask=None,
+     ):
+         # preprocess input
+         d0 = self.input_preprocess(ins)                       # [B,10,100,100,100] -> [B,64,100,100,100]
+@@ -437,7 +443,16 @@ class PerceiverVoxelLangEncoder(nn.Module):
+ 
+         # reshape back to voxel grid
+         latents = latents.view(b, *queries_orig_shape[1:-1], latents.shape[-1]) # [B,20,20,20,64]
+-        latents = rearrange(latents, 'b ... d -> b d ...')                      # [B,64,20,20,20]
++        latents = rearrange(latents, 'b ... d -> b d ...')                      # [B,128,20,20,20]
++
++        # ---- VQAP 码向量注入点 ----
++        # 必须夹在这里：latents 是冻结主干之后的第一个张量，也是唯一同时通向
++        #   平移分支（下方 up0 -> final -> trans_decoder）与
++        #   旋转/夹爪/碰撞分支（下方 feats.extend -> dense0）
++        # 的张量。插到 feats.extend 之后，码就只能影响平移。
++        # z_g 为 None 时完全跳过 -> 与原版逐位等价。
++        if self.code_injector is not None and z_g is not None:
++            latents = self.code_injector(latents, z_g, Z_d, code_mask)
+ 
+         # aggregated features from 2nd softmax and maxpool for MLP decoders
+         feats.extend([self.ss1(latents.contiguous()), self.global_maxp(latents).view(b, -1)])
+diff --git a/agents/peract_bc/qattention_peract_bc_agent.py b/agents/peract_bc/qattention_peract_bc_agent.py
+index aa17d9a..6bd67bc 100644
+--- a/agents/peract_bc/qattention_peract_bc_agent.py
++++ b/agents/peract_bc/qattention_peract_bc_agent.py
+@@ -70,7 +70,8 @@ class QFunction(nn.Module):
+         return coords, rot_and_grip_indicies, ignore_collision
+ 
+     def forward(self, rgb_pcd, proprio, pcd, lang_goal_emb, lang_token_embs,
+-                bounds=None, prev_bounds=None, prev_layer_voxel_grid=None):
++                bounds=None, prev_bounds=None, prev_layer_voxel_grid=None,
++                z_g=None, Z_d=None, code_mask=None):
+         # rgb_pcd will be list of list (list of [rgb, pcd])
+         b = rgb_pcd[0][0].shape[0]
+         pcd_flat = torch.cat(
+@@ -102,11 +103,26 @@ class QFunction(nn.Module):
+                                          lang_token_embs,
+                                          prev_layer_voxel_grid,
+                                          bounds, 
+-                                         prev_bounds)
++                                         prev_bounds,
++                                         z_g=z_g,
++                                         Z_d=Z_d,
++                                         code_mask=code_mask)
+ 
+         return q_trans, q_rot_and_grip, q_ignore_collisions, voxel_grid
+ 
+ 
++# Stage 3 可训模块（VLA_Design §8.2 实测参数量）：
++#   up0 1.536M · dense0 0.262M · final 0.221M · lang_preprocess 0.066M
++#   dense1 0.016M · rot_grip_collision_ff 0.014M · trans_decoder 0.002M  = 2.117M
++#   + code_injector 0.433M（仅 B3）                                       = 2.550M
++# lang_preprocess 必须可训：整任务指令 -> 子任务指令是语言输入分布的实质改变，
++# 而它是语言进入冻结主干的唯一门户。
++STAGE3_TRAINABLE_MODULES = (
++    'up0', 'final', 'trans_decoder', 'dense0', 'dense1',
++    'rot_grip_collision_ff', 'lang_preprocess', 'code_injector',
++)
++
++
+ class QAttentionPerActBCAgent(Agent):
+ 
+     def __init__(self,
+@@ -138,6 +154,9 @@ class QAttentionPerActBCAgent(Agent):
+                  transform_augmentation_rot_resolution: int = 5,
+                  optimizer_type: str = 'adam',
+                  num_devices: int = 1,
++                 stage3_freeze: bool = False,
++                 stage3_arm: str = None,
++                 codebook = None,
+                  ):
+         self._layer = layer
+         self._coordinate_bounds = coordinate_bounds
+@@ -166,6 +185,13 @@ class QAttentionPerActBCAgent(Agent):
+         self._transform_augmentation_rot_resolution = transform_augmentation_rot_resolution
+         self._optimizer_type = optimizer_type
+         self._num_devices = num_devices
++        # Stage 3 冻结边界开关。默认 False -> 与原版 PerAct 完全一致（全参数可训）。
++        # 只有显式打开才会冻结主干，这是「不打开开关就是原版」这条回撤保证的一部分。
++        self._stage3_freeze = stage3_freeze
++        # 实验臂（"B0"/"B1"/"B2"/"B3"）。None -> 不做字段隔离，即原版行为。
++        self._stage3_arm = stage3_arm
++        # 冻结码本，仅 B3 传入；None -> 不查表、不注入。
++        self._codebook = codebook
+         self._num_rotation_classes = num_rotation_classes
+         self._rotation_resolution = rotation_resolution
+ 
+@@ -188,6 +214,28 @@ class QAttentionPerActBCAgent(Agent):
+             max_num_coords=np.prod(self._image_resolution) * self._num_cameras,
+         )
+ 
++        # 冻结码本随 agent 上设备（create_agent 里是在 CPU 上加载的）
++        if self._codebook is not None:
++            self._codebook = self._codebook.to(device)
++
++        # ---- Stage 3 冻结边界（VLA_Design §8.2）----
++        # 🔴 必须在 QFunction 之前做：QFunction.__init__ 会用 DDP 包装 perceiver_encoder，
++        # 而 DDP 在构造时就固定了参与 all-reduce 的参数集合。若在其之后才置
++        # requires_grad=False，DDP 每步都会等那些永远不会到来的梯度，第二步即报
++        # "Expected to have finished reduction in the prior iteration"。
++        if training and self._stage3_freeze:
++            for name, param in self._perceiver_encoder.named_parameters():
++                param.requires_grad = any(
++                    f'.{m}.' in f'.{name}.' for m in STAGE3_TRAINABLE_MODULES)
++            n_train = sum(p.numel() for p in self._perceiver_encoder.parameters()
++                          if p.requires_grad)
++            logging.info('Stage 3 冻结边界：可训参数 %s / 总计 %s' % (
++                f'{n_train:,}',
++                f'{sum(p.numel() for p in self._perceiver_encoder.parameters()):,}'))
++            assert 2.0e6 < n_train < 2.7e6, (
++                f'冻结边界不符预期：可训 {n_train:,}，应在 2.0M~2.7M '
++                f'（B1/B2 = 2.117M，B3 = 2.55M）')
++
+         self._q = QFunction(self._perceiver_encoder,
+                             self._voxelizer,
+                             self._bounds_offset,
+@@ -205,10 +253,15 @@ class QAttentionPerActBCAgent(Agent):
+                                                device=device).unsqueeze(0)
+ 
+         if self._training:
++            # 冻结已在 QFunction 构造之前完成（见上），这里只需把可训参数过滤出来。
++            # 必须过滤而不能只靠 requires_grad=False：LAMB 带 weight decay，
++            # 冻结参数交给优化器仍会被衰减改动。
++            params = [p for p in self._q.parameters() if p.requires_grad]
++
+             # optimizer
+             if self._optimizer_type == 'lamb':
+                 self._optimizer = Lamb(
+-                    self._q.parameters(),
++                    params,
+                     lr=self._lr,
+                     weight_decay=self._lambda_weight_l2,
+                     betas=(0.9, 0.999),
+@@ -216,7 +269,7 @@ class QAttentionPerActBCAgent(Agent):
+                 )
+             elif self._optimizer_type == 'adam':
+                 self._optimizer = torch.optim.Adam(
+-                    self._q.parameters(),
++                    params,
+                     lr=self._lr,
+                     weight_decay=self._lambda_weight_l2,
+                 )
+@@ -365,12 +418,30 @@ class QAttentionPerActBCAgent(Agent):
+         return q_collision_softmax
+ 
+     def update(self, step: int, replay_sample: dict) -> dict:
++        # ---- Stage 3 字段隔离（VLA_Design §8.6.2）----
++        # 三臂共享同一份 replay，靠白名单守卫防止串读：越权访问第一次就抛异常，
++        # 而不是悄悄训出一个说不清是什么的模型。
++        if self._stage3_arm is not None:
++            from stage3.arms import GuardedSample, lang_fields_for
++            replay_sample = GuardedSample(replay_sample, self._stage3_arm)
++            emb_key, tok_key = lang_fields_for(self._stage3_arm)
++        else:
++            emb_key, tok_key = 'lang_goal_emb', 'lang_token_embs'
++
+         action_trans = replay_sample['trans_action_indicies'][:, self._layer * 3:self._layer * 3 + 3].int()
+         action_rot_grip = replay_sample['rot_grip_action_indicies'].int()
+         action_gripper_pose = replay_sample['gripper_pose']
+         action_ignore_collisions = replay_sample['ignore_collisions'].int()
+-        lang_goal_emb = replay_sample['lang_goal_emb'].float()
+-        lang_token_embs = replay_sample['lang_token_embs'].float()
++        lang_goal_emb = replay_sample[emb_key].float()
++        lang_token_embs = replay_sample[tok_key].float()
++
++        # ---- Stage 3 码查表（仅 B3）----
++        z_g = Z_d = code_mask = None
++        if self._codebook is not None:
++            k_g = replay_sample['subtask_k_global']
++            k_d = replay_sample['subtask_k_detail']
++            code_mask = replay_sample['subtask_code_mask'].float().to(self._device)
++            z_g, Z_d = self._codebook(k_g.to(self._device), k_d.to(self._device))
+         prev_layer_voxel_grid = replay_sample.get('prev_layer_voxel_grid', None)
+         prev_layer_bounds = replay_sample.get('prev_layer_bounds', None)
+         device = self._device
+@@ -416,7 +487,10 @@ class QAttentionPerActBCAgent(Agent):
+                              lang_token_embs,
+                              bounds,
+                              prev_layer_bounds,
+-                             prev_layer_voxel_grid)
++                             prev_layer_voxel_grid,
++                             z_g=z_g,
++                             Z_d=Z_d,
++                             code_mask=code_mask)
+ 
+         # argmax to choose best action
+         coords, \
+@@ -525,7 +599,28 @@ class QAttentionPerActBCAgent(Agent):
+         bounds = self._coordinate_bounds
+         prev_layer_voxel_grid = observation.get('prev_layer_voxel_grid', None)
+         prev_layer_bounds = observation.get('prev_layer_bounds', None)
+-        lang_goal_tokens = observation.get('lang_goal_tokens', None).long()
++
++        # ---- Stage 3 语言防线（B2/B3）----
++        # 🔴 observation['lang_goal_tokens'] 由 rlbench_env.py 从 self._lang_goal
++        #    生成，那**永远是整任务指令**。B2/B3 训练时喂的是子任务指令，评测时若
++        #    仍拿整任务指令，跑出来就是「挂着 B2/B3 名字的 B1 成绩」——不报错、不告警。
++        #    这与 BUG 1（B3 评测拿不到码）是同一类静默退化，同样必须硬失败。
++        #    在线 Planner 只需往 observation 里塞 'subtask_lang_goal_tokens'。
++        if self._stage3_arm is not None:
++            from stage3.arms import ARMS
++            if ARMS[self._stage3_arm].uses_subtask_lang:
++                if observation.get('subtask_lang_goal_tokens', None) is None:
++                    raise RuntimeError(
++                        f"本 agent 是 {self._stage3_arm} 臂（用子任务指令训练的），但 "
++                        "observation 里没有 'subtask_lang_goal_tokens'。"
++                        "B2/B3 在评测时必须由在线 Planner 提供子任务指令的 CLIP token。"
++                        "若确实想评测「用整任务指令跑 B2/B3 权重」这一消融，"
++                        "请显式把 agent 的 stage3_arm 置 None。")
++                lang_goal_tokens = observation['subtask_lang_goal_tokens'].long()
++            else:
++                lang_goal_tokens = observation.get('lang_goal_tokens', None).long()
++        else:
++            lang_goal_tokens = observation.get('lang_goal_tokens', None).long()
+ 
+         # extract CLIP language embs
+         with torch.no_grad():
+@@ -552,6 +647,28 @@ class QAttentionPerActBCAgent(Agent):
+         prev_layer_voxel_grid = prev_layer_voxel_grid.to(self._device) if prev_layer_voxel_grid is not None else None
+         prev_layer_bounds = prev_layer_bounds.to(self._device) if prev_layer_bounds is not None else None
+ 
++        # ---- Stage 3 码查表（仅 B3）----
++        # 码经 observation 字典传入 —— 这是 env runner 到 agent 的天然通道，
++        # 在线 Planner 只需往 observation 里塞这三个键，调用链上的签名一个都不用改。
++        #
++        # 🔴 这里必须硬失败而不是静默跳过：若 B3 在评测时拿不到码，注入层会被
++        # `z_g is None` 的守卫完全跳过，跑出来的就是 B2 的成绩 —— 不报错、不告警，
++        # 我们会据此得出「码本没用」的错误结论，而这正是全文的核心主张。
++        z_g = Z_d = code_mask = None
++        if self._codebook is not None:
++            if 'subtask_k_global' not in observation:
++                raise RuntimeError(
++                    "本 agent 装配了码本（B3），但 observation 里没有 'subtask_k_global'。"
++                    "B3 在评测时必须由在线 Planner 提供 subtask_k_global / "
++                    "subtask_k_detail / subtask_code_mask。若确实想评测「B3 架构但不注入码」"
++                    "这一消融，请显式把 agent 的 codebook 置 None。")
++            k_g = torch.as_tensor(observation['subtask_k_global'], device=self._device).reshape(-1)
++            k_d = torch.as_tensor(observation['subtask_k_detail'], device=self._device).reshape(k_g.shape[0], -1)
++            cm = observation.get('subtask_code_mask', None)
++            code_mask = (torch.ones_like(k_g, dtype=torch.float32) if cm is None
++                         else torch.as_tensor(cm, device=self._device).reshape(-1).float())
++            z_g, Z_d = self._codebook(k_g, k_d)
++
+         # inference
+         q_trans, \
+         q_rot_grip, \
+@@ -563,7 +680,10 @@ class QAttentionPerActBCAgent(Agent):
+                            lang_token_embs,
+                            bounds,
+                            prev_layer_bounds,
+-                           prev_layer_voxel_grid)
++                           prev_layer_voxel_grid,
++                           z_g=z_g,
++                           Z_d=Z_d,
++                           code_mask=code_mask)
+ 
+         # softmax Q predictions
+         q_trans = self._softmax_q_trans(q_trans)
+@@ -612,14 +732,25 @@ class QAttentionPerActBCAgent(Agent):
+                          info=info)
+ 
+     def update_summaries(self) -> List[Summary]:
+-        summaries = [
+-            ImageSummary('%s/update_qattention' % self._name,
+-                         transforms.ToTensor()(visualise_voxel(
+-                             self._vis_voxel_grid.detach().cpu().numpy(),
+-                             self._vis_translation_qvalue.detach().cpu().numpy(),
+-                             self._vis_max_coordinate.detach().cpu().numpy(),
+-                             self._vis_gt_coordinate.detach().cpu().numpy())))
+-        ]
++        # 🔴 体素可视化是训练里**唯一**依赖 X 的东西（visualise_voxel ->
++        #    pyrender.OffscreenRenderer），而这个依赖代价极高：
++        #      * 训练必须套 xvfb-run；
++        #      * `xvfb-run -a` 自动选 display 号有竞态 —— 并发启动时两个进程
++        #        可能选中同一个号，其中一个退出就把另一个的 X server 一起杀掉。
++        #        实测后果：B3 训练跑到 15,600 步时被一个刚结束的评测分片带死
++        #        （"XIO: fatal IO error on X server :127"），损失约 40 分钟；
++        #      * 这张调试图没人看，还让 B1 的训练 tfevents 涨到 245 MB。
++        #    默认关掉后训练**不再需要 X**，也就不会再被任何 xvfb 事故波及。
++        #    确实要看时设 PERACT_VOXEL_SUMMARY=1。
++        summaries = []
++        if os.environ.get('PERACT_VOXEL_SUMMARY', '0') == '1':
++            summaries.append(
++                ImageSummary('%s/update_qattention' % self._name,
++                             transforms.ToTensor()(visualise_voxel(
++                                 self._vis_voxel_grid.detach().cpu().numpy(),
++                                 self._vis_translation_qvalue.detach().cpu().numpy(),
++                                 self._vis_max_coordinate.detach().cpu().numpy(),
++                                 self._vis_gt_coordinate.detach().cpu().numpy()))))
+ 
+         for n, v in self._summaries.items():
+             summaries.append(ScalarSummary('%s/%s' % (self._name, n), v))
+@@ -630,10 +761,19 @@ class QAttentionPerActBCAgent(Agent):
+                 ImageSummary('%s/crops/%s' % (self._name, name), crops)])
+ 
+         for tag, param in self._q.named_parameters():
+-            # assert not torch.isnan(param.grad.abs() <= 1.0).all()
+-            summaries.append(
+-                HistogramSummary('%s/gradient/%s' % (self._name, tag),
+-                                 param.grad))
++            # 🔴 Stage 3 冻结了 94% 的参数，它们的 param.grad 恒为 None，
++            #    直接喂给 add_histogram 会抛
++            #        NotImplementedError: Got <class 'NoneType'>,
++            #        but numpy array or torch tensor are expected
++            #    而这条路径每 log_freq 步才走一次 —— 训练能正常跑完 100 步再崩。
++            #    顺带：冻结权重恒定不变，每 100 步给它们写一次直方图纯属浪费
++            #    （33.2 M 参数 vs 可训的 2.1 M），一并只记可训的。
++            if not param.requires_grad:
++                continue
++            if param.grad is not None:
++                summaries.append(
++                    HistogramSummary('%s/gradient/%s' % (self._name, tag),
++                                     param.grad))
+             summaries.append(
+                 HistogramSummary('%s/weight/%s' % (self._name, tag),
+                                  param.data))
+@@ -648,6 +788,18 @@ class QAttentionPerActBCAgent(Agent):
+                              self._act_qvalues.cpu().numpy(),
+                              self._act_max_coordinate.cpu().numpy())))]
+ 
++    # 🔴 YARR 的「断点恢复」只恢复权重，不恢复优化器与调度器
++    #    （offline_train_runner.py 只调 agent.load_weights）。于是每次停-续都会：
++    #      * LAMB 的一阶/二阶动量归零 —— 相当于重新冷启动一次；
++    #      * 若开了 lr_scheduler，warmup 与 cosine 相位一并归零。
++    #    三件事都不报错。本项目允许中途换卡续训，所以必须把这两份状态一起持久化。
++    #    DDP 下各 rank 的优化器状态本来就同步一致，存 rank0 的、在任意卡数上加载都正确
++    #    （_save_model 也只由 rank0 调用）。
++    OPTIM_SUFFIX = '_optim.pt'
++
++    def _optim_path(self, savedir: str) -> str:
++        return os.path.join(savedir, '%s%s' % (self._name, self.OPTIM_SUFFIX))
++
+     def load_weights(self, savedir: str):
+         device = self._device if not self._training else torch.device('cuda:%d' % self._device)
+         weight_file = os.path.join(savedir, '%s.pt' % self._name)
+@@ -655,17 +807,60 @@ class QAttentionPerActBCAgent(Agent):
+ 
+         # load only keys that are in the current model
+         merged_state_dict = self._q.state_dict()
++        n_skipped_vox = 0
+         for k, v in state_dict.items():
+             if not self._training:
+                 k = k.replace('_qnet.module', '_qnet')
+             if k in merged_state_dict:
++                cur = merged_state_dict[k]
++                if getattr(cur, 'shape', None) != getattr(v, 'shape', None):
++                    # 🔴 VoxelGrid 的缓冲按 batch_size 定形（build 里
++                    #    `batch_size if training else 1`）：训练存的是 batch=4 的形状，
++                    #    评测时模型是 batch=1，必然对不上。它们全部由构造参数派生、
++                    #    build() 时已重建，跳过即可。
++                    #    （已把这些 buffer 改成 persistent=False，新 ckpt 不再包含；
++                    #      这条分支只为兼容此前已写出的 checkpoint。）
++                    if '_voxelizer' in k:
++                        n_skipped_vox += 1
++                        continue
++                    # 其它任何形状不符都说明 ckpt 与当前模型结构不同源，必须硬失败，
++                    # 绝不能悄悄跳过训出一个说不清是什么的模型。
++                    raise RuntimeError(
++                        f"checkpoint 与当前模型结构不符：'{k}' "
++                        f"ckpt {tuple(v.shape)} vs 模型 {tuple(cur.shape)}")
+                 merged_state_dict[k] = v
+             else:
+                 if '_voxelizer' not in k:
+                     logging.warning("key %s not found in checkpoint" % k)
++        if n_skipped_vox:
++            logging.info("跳过 %d 个形状不符的 voxelizer 缓冲（batch 维差异，运行时重建）",
++                         n_skipped_vox)
+         self._q.load_state_dict(merged_state_dict)
+         print("loaded weights from %s" % weight_file)
+ 
++        # 优化器/调度器状态：存在才加载。官方 peract_600k 与本项目早期的
++        # checkpoint 都没有这个文件，此时保持冷启动（与改动前行为一致）。
++        if self._training:
++            optim_file = self._optim_path(savedir)
++            if os.path.isfile(optim_file):
++                state = torch.load(optim_file, map_location=device, weights_only=False)
++                self._optimizer.load_state_dict(state['optimizer'])
++                if self._lr_scheduler and state.get('scheduler') is not None:
++                    self._scheduler.load_state_dict(state['scheduler'])
++                print("loaded optimizer/scheduler state from %s" % optim_file)
++            else:
++                logging.warning(
++                    "%s 不存在 —— 优化器为冷启动（LAMB 动量归零）。"
++                    "从官方 ckpt 起步时这是预期的；若是中途续训看到这行，"
++                    "说明上一次的优化器状态没存下来。", optim_file)
++
+     def save_weights(self, savedir: str):
+         torch.save(
+-            self._q.state_dict(), os.path.join(savedir, '%s.pt' % self._name))
+\ No newline at end of file
++            self._q.state_dict(), os.path.join(savedir, '%s.pt' % self._name))
++        if self._training and getattr(self, '_optimizer', None) is not None:
++            torch.save({
++                'optimizer': self._optimizer.state_dict(),
++                'scheduler': (self._scheduler.state_dict()
++                              if self._lr_scheduler and getattr(self, '_scheduler', None)
++                              is not None else None),
++            }, self._optim_path(savedir))
+\ No newline at end of file
+diff --git a/conf/eval.yaml b/conf/eval.yaml
+index 208ab9b..f395817 100644
+--- a/conf/eval.yaml
++++ b/conf/eval.yaml
+@@ -32,4 +32,21 @@ cinematic_recorder:
+     camera_resolution: [1280, 720]
+     fps: 30
+     rotate_speed: 0.005
+-    save_path: '/tmp/videos/'
+\ No newline at end of file
++    save_path: '/tmp/videos/'
++stage3:
++    # 用哪种在线 planner —— B2/B3 评测的唯一开关（见 stage3/planners.py）：
++    #   template  (task, variation) 模板库 + 确定性状态机。默认。
++    #   flat      对照组：子任务指令全换成整任务指令，码与分段不变。
++    #   vlm       在线 VLM 闭环，接口预留、尚未实现。
++    # 计划文件由种类和 split 推出（plans_<split>_<kind>.json），不再单独配置。
++    # B0/B1 走不到这里。
++    planner: template
++    # 码从哪来（只对 B3 有意义）：
++    #   plan     计划里预存的码 —— 模板库查表，取自同 (task,variation) 的
++    #            另一条 train episode，与当下画面无关
++    #   adapter  实时调 Stage 2 Adapter(当前 front+wrist, 子任务指令) 出码，
++    #            子任务切换时调一次、段内不变 —— 这才是 VLA_Design §3 的部署流程
++    codes: plan
++    # 每局 planner 轨迹的落盘目录。留空则不记录。
++    # 这是「B3 成绩不好时是 planner 还是模型的锅」的唯一证据，评测时建议开。
++    trace_dir: null
+diff --git a/conf/stage3.yaml b/conf/stage3.yaml
+new file mode 100644
+index 0000000..a241d05
+--- /dev/null
++++ b/conf/stage3.yaml
+@@ -0,0 +1,100 @@
++# Stage 3 训练配置（B1/B2/B3 共用；只有 stage3.arm 与是否给 codebook 不同）
++#
++# 用法：
++#   python train.py --config-name=stage3 stage3.arm=B1 \
++#       framework.logdir=/data0/xiexiao/VQAP/checkpoints/stage3_main
++#
++# 🔴 三臂公平性硬约束（Exp_Design）：同 K 步、同一份 replay、同 batch、
++#    同 LR、同 warmup、同种子、同 SE3 增广。唯一差异是语言输入与是否注入码。
++
++defaults:
++    - method: PERACT_BC
++
++stage3:
++    arm: B1                                   # B0 | B1 | B2 | B3 | B4（定义见 stage3/arms.py）
++    codebook: /data0/xiexiao/VQAP/checkpoints/vqap_pretrain/stage1/codebook.pth
++    planner_cache_dir: /data0/xiexiao/VQAP/aavla_data/planner_cache/train
++    split: train
++    # 码向量注入层版本（仅对启用码的臂有意义）：
++    #   v1  FiLM + 门控 cross-attn —— B3 用的那版。两个零初始化张量被 LAMB
++    #       的 ‖Δp‖≡lr·‖p‖ 锁死，实测 100000 步注入幅度只从 0.0056% 长到
++    #       0.0095%，码本贡献为零（B1@40000 = B3@40000 = 35.33%）。
++    #   v2  纯残差相加，无门控无 FiLM —— B4 用。删掉 gate 后注入幅度直接
++    #       从 0.0064% 变成 16.79%（单测实测）。
++    #
++    # 🔴 null = **由臂决定**（stage3/arms.py 的 Arm.injector 是唯一真源）。
++    #    这里写成非 null 时它只是一条断言：与臂声明不一致就抛异常。
++    #    别在命令行传 stage3.injector —— B4 只要 stage3.arm=B4 就够了。
++    injector: null
++
++ddp:
++    master_addr: "localhost"
++    master_port: "29500"
++    num_devices: 2                            # 🔴 三臂必须一致；用 CUDA_VISIBLE_DEVICES 锁定具体的卡
++
++rlbench:
++    task_name: "seen12"
++    # Seen12（VLA_Design §2.4）
++    tasks: [close_jar, light_bulb_in, open_drawer, place_cups,
++            place_shape_in_shape_sorter, push_buttons, put_groceries_in_cupboard,
++            reach_and_drag, slide_block_to_color_target, stack_blocks,
++            place_wine_at_rack_location, sweep_to_dustpan_of_size]
++    demos: 100
++    demo_path: /data0/xiexiao/VQAP/aavla_data/rlbench/train
++    episode_length: 25
++    cameras: [front, left_shoulder, right_shoulder, wrist]
++    camera_resolution: [128, 128]
++    scene_bounds: [-0.3, -0.5, 0.6, 0.7, 0.5, 1.6]
++    include_lang_goal_in_obs: True
++
++replay:
++    batch_size: 4                             # 每卡；P4 实测 torch 峰值 26.1G / 48.5G 卡
++    timesteps: 1
++    prioritisation: False
++    task_uniform: True                        # 任务级均匀采样，拉平 stack_blocks 的 35% 占比
++    use_disk: True
++    path: /data0/xiexiao/VQAP/aavla_data/replay/seen12   # 三臂共享
++    max_parallel_processes: 12
++
++framework:
++    log_freq: 100
++    save_freq: 2500                           # 20 个 ckpt
++    train_envs: 0
++    replay_ratio: null
++    transitions_before_train: 200
++    tensorboard_logging: True
++    csv_logging: True
++    training_iterations: 20001                # 训完自然退出，不用手动 kill
++    # 🔴 它同时是 train.py 的「已训够就退出」判据 **和** LR 调度器的视界。
++    #    现在 lr_scheduler=False，改它不影响 LR，所以可以安全地用它控制训练长度；
++    #    **若将来打开调度器，这条就不成立**（num_cycles = 本值 // 10000，
++    #    且改视界会整条改变 LR 曲线）。延长 K 时直接改大再续训即可。
++    gpu: 0
++    env_gpu: 0
++    logdir: /data0/xiexiao/VQAP/checkpoints/stage3_main   # 权重与 tb 落这里；
++                                                          # nohup 日志在 log/p5/
++    logging_level: 20
++    seeds: 1
++    start_seed: 0
++    load_existing_weights: True               # 🔴 必须 True，否则断点恢复不生效
++    num_weights_to_keep: 20                   # 20k 内不会触发自动删除。
++                                              # 选完 K 后用 scripts/prune_runs.py 显式剪枝，
++                                              # 不让它在后台悄悄删掉选 K 的依据。
++    num_workers: 4
++    record_every_n: -1
++
++method:
++    pos_encoding_with_lang: False             # 🔴 官方 ckpt 是 false，仓库默认 True
++    transform_augmentation:
++        aug_rpy: [0.0, 0.0, 0.0]              # 对齐官方 ckpt
++    lr: 1.0e-4                                # 官方 5e-4 是从零训 600k 步的值
++    # 不设 num_warmup_steps：method/PERACT_BC.yaml 里 lr_scheduler=False，
++    # 该项**完全不生效**（官方 600k 预训练同样是 lr_scheduler=False，恒定 LR）。
++    # 写在这里只会让人误以为有 warmup。若将来要打开调度器，注意
++    # num_cycles = training_iterations // 10000，且 training_iterations 兼任
++    # 调度器视界 —— 用它做早停会静默改变整条 LR 曲线（实测 LR 在 step
++    # 10400 / 20300 掉到 ~0）。
++
++hydra:
++    run:
++        dir: ${framework.logdir}/${stage3.arm}
+diff --git a/eval.py b/eval.py
+index d7e7fe2..8b64438 100644
+--- a/eval.py
++++ b/eval.py
+@@ -45,7 +45,49 @@ def eval_seed(train_cfg,
+               env_config) -> None:
+ 
+     tasks = eval_cfg.rlbench.tasks
++
++    # ---- Stage 3：B2/B3 的评测需要在线 Planner ----
++    # act() 的语言输入只有 observation['lang_goal_tokens']，而它由
++    # rlbench_env.py 从 self._lang_goal 生成 —— 那**永远是整任务指令**。
++    # B2/B3 用子任务指令训练，评测时必须换成子任务指令（B3 还要码），
++    # 否则 act() 的语言防线会直接 raise（这是刻意的，防止静默跑成 B1 的成绩）。
++    _s3 = train_cfg.get('stage3', None)
++    _arm = None if _s3 is None else _s3.get('arm', None)
+     rg = RolloutGenerator()
++    if _arm is not None:
++        _root = os.path.abspath(os.path.join(os.path.dirname(__file__),
++                                             os.pardir, os.pardir))
++        if _root not in sys.path:
++            sys.path.insert(0, _root)
++        from stage3.arms import ARMS
++        if ARMS[_arm].uses_subtask_lang:
++            from stage3.rollout import Stage3RolloutGenerator
++            from stage3.planners import make_factory, DEFAULT_KIND
++            _s3e = eval_cfg.get('stage3', {})
++            # 用哪种 planner 只在 stage3/planners.py 里决定；这里只是转发配置。
++            # 换成在线 VLM planner = 改这一个配置值，本文件不动。
++            _kind = _s3e.get('planner', None) or DEFAULT_KIND
++            _split = os.path.basename(str(eval_cfg.rlbench.demo_path).rstrip('/'))
++            _factory = make_factory(_kind, _split)
++            # 码从哪来：'plan' = 计划里预存的（模板库查表，旧行为）
++            #           'adapter' = 实时调 Stage 2 Adapter（对齐 VLA_Design §3）
++            _codes = (_s3e.get('codes', None) or 'plan')
++            if _kind == 'vlm-plan' and _codes != 'adapter':
++                # vlm-plan 生成的是全新指令，模板库里没有对应的码可查；
++                # 用 plan 码等于把别的 episode 的码硬套上去，静默出错。
++                raise ValueError(
++                    "planner=vlm-plan 必须配 stage3.codes=adapter："
++                    "它现场生成子任务指令，码只能由实时 Adapter 预测。")
++            _src = None
++            if ARMS[_arm].codes and _codes == 'adapter':
++                from stage3.adapter_codes import LiveAdapter
++                _src = LiveAdapter()
++            elif _codes not in ('plan', 'adapter'):
++                raise ValueError(f"stage3.codes 只能是 plan/adapter，收到 {_codes!r}")
++            rg = Stage3RolloutGenerator(_factory,
++                                        with_codes=ARMS[_arm].codes,
++                                        trace_dir=_s3e.get('trace_dir', None),
++                                        code_source=_src)
+ 
+     if train_cfg.method.name == 'ARM':
+         raise NotImplementedError('ARM not yet supported for eval.py')
+diff --git a/helpers/custom_rlbench_env.py b/helpers/custom_rlbench_env.py
+index 02cd120..01ca162 100644
+--- a/helpers/custom_rlbench_env.py
++++ b/helpers/custom_rlbench_env.py
+@@ -62,6 +62,18 @@ class CustomRLBenchEnv(RLBenchEnv):
+         return obs_elems
+ 
+     def extract_obs(self, obs: Observation, t=None, prev_action=None):
++        # 🔴 在线 planner 的旁路：joint_velocities / gripper_pose 是仿真器算好的，
++        #    但下面会被置空以保持 low_dim_state 与训练时一致（4 维）。
++        #    这里在置空**之前**留一份给 planner，**不进 obs_dict** ——
++        #    模型看到的输入逐位不变，没有任何分布风险。
++        #    （joint_velocities 尤其重要：它是「机械臂真的停了」的唯一直接信号，
++        #    而且下面还原 gripper_pose / joint_positions 时唯独没有还原它。）
++        self._planner_state = {
++            "joint_velocities": None if obs.joint_velocities is None
++                                else np.array(obs.joint_velocities, dtype=np.float32),
++            "gripper_pose": None if obs.gripper_pose is None
++                            else np.array(obs.gripper_pose, dtype=np.float32),
++        }
+         obs.joint_velocities = None
+         grip_mat = obs.gripper_matrix
+         grip_pose = obs.gripper_pose
+@@ -244,6 +256,18 @@ class CustomMultiTaskRLBenchEnv(MultiTaskRLBenchEnv):
+         return obs_elems
+ 
+     def extract_obs(self, obs: Observation, t=None, prev_action=None):
++        # 🔴 在线 planner 的旁路：joint_velocities / gripper_pose 是仿真器算好的，
++        #    但下面会被置空以保持 low_dim_state 与训练时一致（4 维）。
++        #    这里在置空**之前**留一份给 planner，**不进 obs_dict** ——
++        #    模型看到的输入逐位不变，没有任何分布风险。
++        #    （joint_velocities 尤其重要：它是「机械臂真的停了」的唯一直接信号，
++        #    而且下面还原 gripper_pose / joint_positions 时唯独没有还原它。）
++        self._planner_state = {
++            "joint_velocities": None if obs.joint_velocities is None
++                                else np.array(obs.joint_velocities, dtype=np.float32),
++            "gripper_pose": None if obs.gripper_pose is None
++                            else np.array(obs.gripper_pose, dtype=np.float32),
++        }
+         obs.joint_velocities = None
+         grip_mat = obs.gripper_matrix
+         grip_pose = obs.gripper_pose
+diff --git a/requirements.txt b/requirements.txt
+index f0e3fcf..6476a91 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -2,17 +2,15 @@ absl-py==0.15.0
+ einops==0.3.2
+ ftfy
+ gdown==3.13.1
+-hydra-core==1.0.5
++hydra-core==1.1.2
+ matplotlib
+-numpy==1.21
+-packaging==21.3
++numpy==1.26.4
++packaging
+ pandas==1.4.1
++pyglet<2
+ pyrender==0.1.45
+-pytorch3d==0.3.0
+ regex
+-scipy==1.4.1
++scipy>=1.10
+ tensorboard
+-torch==1.7.1
+-torchvision==0.8.2
+-transformers==4.3.2
++transformers==4.53.2
+ trimesh==3.9.34
+diff --git a/run_seed_fn.py b/run_seed_fn.py
+index 3be912b..8c667d4 100644
+--- a/run_seed_fn.py
++++ b/run_seed_fn.py
+@@ -1,4 +1,6 @@
+ import os
++import sys
++import time
+ import pickle
+ import gc
+ import logging
+@@ -23,6 +25,41 @@ from agents import arm
+ from agents.baselines import bc_lang, vit_bc_lang
+ 
+ 
++# 仓库根（本文件在 <repo>/source/peract/ 下）加入 sys.path，以便 import stage3.*
++_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir))
++if _REPO_ROOT not in sys.path:
++    sys.path.insert(0, _REPO_ROOT)
++from stage3 import replay_dataset
++
++
++def _wait_for_artifact(replay_path, rank, timeout_s: int = 7200) -> None:
++    """非 0 号 rank 等 rank0 把 replay 工件建好。
++
++    不能让多个 rank 同时填同一个目录（见下方注释），也不能用 dist.barrier() 干等 ——
++    构建可能要半小时，barrier 的默认超时会先到。这里轮询工件标记，超时即硬失败。
++    """
++    t0 = time.time()
++    while not replay_dataset.is_built(replay_path):
++        if time.time() - t0 > timeout_s:
++            raise RuntimeError(
++                f"rank{rank} 等待 rank0 构建 replay 工件超时（{timeout_s}s）：{replay_path}")
++        time.sleep(10)
++
++
++def _set_all_seeds(seed: int) -> None:
++    """三臂公平性要求「同种子」（Exp_Design）。
++
++    上游 train.py / run_seed_fn.py / offline_train_runner.py 里**没有任何**
++    manual_seed，三臂会看到不同的样本序列与不同的 SE3 增广 —— 这是能零成本
++    消除的混淆项。
++    """
++    import random as _random
++    _random.seed(seed)
++    np.random.seed(seed)
++    torch.manual_seed(seed)
++    torch.cuda.manual_seed_all(seed)
++
++
+ def run_seed(rank,
+              cfg: DictConfig,
+              obs_config: ObservationConfig,
+@@ -33,6 +70,17 @@ def run_seed(rank,
+     dist.init_process_group("gloo",
+                             rank=rank,
+                             world_size=world_size)
++    # 🔴 日志级别必须在 create_agent **之前**设。
++    # mp.spawn 出来的子进程 root logger 是全新的（默认 WARNING），而原来只有
++    # OfflineTrainRunner(logging_level=...) 会设它 —— 那已经在 create_agent 之后。
++    # 后果：create_agent 里的
++    #     'Stage 3 [B4] 码本已加载 …' / 'Stage 3 注入层已挂载(v2) …'
++    # 两行被静默丢弃，而这正是「这一轮到底训的是哪个臂、挂的哪版注入层」
++    # 唯一的直接证据（间接证据是稍后那行「冻结边界：可训参数 …」，
++    # B1/B2=2,117,917 · B3=2,550,685 · B4=2,517,661）。
++    logging.getLogger().setLevel(cfg.framework.logging_level)
++    # 各 rank 用 seed+rank，保证 rank 间采样不同、但整体对三臂可复现
++    _set_all_seeds(seed * 1000 + rank)
+ 
+     task = cfg.rlbench.tasks[0]
+     tasks = cfg.rlbench.tasks
+@@ -104,22 +152,56 @@ def run_seed(rank,
+         agent = c2farm_lingunet_bc.launch_utils.create_agent(cfg)
+ 
+     elif cfg.method.name == 'PERACT_BC':
++        # ---- Stage 3 ----
++        # arm 决定是否需要 subtask_* 字段：B2/B3 要，B0/B1 不要。
++        # 但**三臂共享同一份 replay**（152 GB，建三份不可接受，且共享才能保证
++        # 同种子下看到逐条相同的样本），所以只要配置里出现 stage3 段就一律建全字段，
++        # B1 靠 stage3/arms.py 的白名单守卫拿不到它们。
++        _s3 = cfg.get('stage3', None)
++        _need_subtask = _s3 is not None and _s3.get('planner_cache_dir', None) is not None
++
+         replay_buffer = peract_bc.launch_utils.create_replay(
+             cfg.replay.batch_size, cfg.replay.timesteps,
+             cfg.replay.prioritisation,
+             cfg.replay.task_uniform,
+             replay_path if cfg.replay.use_disk else None,
+             cams, cfg.method.voxel_sizes,
+-            cfg.rlbench.camera_resolution)
+-
+-        peract_bc.launch_utils.fill_multi_task_replay(
+-            cfg, obs_config, rank,
+-            replay_buffer, tasks, cfg.rlbench.demos,
+-            cfg.method.demo_augmentation, cfg.method.demo_augmentation_every_n,
+-            cams, cfg.rlbench.scene_bounds,
+-            cfg.method.voxel_sizes, cfg.method.bounds_offset,
+-            cfg.method.rotation_resolution, cfg.method.crop_augmentation,
+-            keypoint_method=cfg.method.keypoint_method)
++            cfg.rlbench.camera_resolution,
++            stage3_subtask_fields=_need_subtask)
++
++        # ---- 共享 replay 工件（stage3/replay_dataset.py）----
++        # 🔴 上游在这里无条件调 fill_multi_task_replay，而 train.py 用 mp.spawn 起
++        #    N 个 rank、每个 rank 都会调它，写的是同一批 <cursor>.replay 文件名：
++        #      * 每次启动/续训都重建 176 GB；
++        #      * 同名文件被两个进程同时 open('wb') -> pickle 半截写入 ->
++        #        训练跑到几小时后突然 UnpicklingError；
++        #      * 各 rank 的 _task_idxs 与磁盘内容错配 -> task_uniform 采样静默失真。
++        #    工件已建好时直接挂载（毫秒级），三臂读到逐字节相同的样本。
++        if replay_dataset.is_built(replay_path):
++            replay_dataset.attach(replay_buffer, replay_path, verbose=(rank == 0))
++        else:
++            if rank != 0:
++                # 只让 rank0 建，其余 rank 等它建完再挂 —— 杜绝并发写同名文件。
++                _wait_for_artifact(replay_path, rank)
++                replay_dataset.attach(replay_buffer, replay_path, verbose=False)
++            else:
++                peract_bc.launch_utils.fill_multi_task_replay(
++                    cfg, obs_config, rank,
++                    replay_buffer, tasks, cfg.rlbench.demos,
++                    cfg.method.demo_augmentation, cfg.method.demo_augmentation_every_n,
++                    cams, cfg.rlbench.scene_bounds,
++                    cfg.method.voxel_sizes, cfg.method.bounds_offset,
++                    cfg.method.rotation_resolution, cfg.method.crop_augmentation,
++                    keypoint_method=cfg.method.keypoint_method,
++                    planner_cache_dir=(_s3.get('planner_cache_dir', None) if _s3 else None),
++                    data_split=(_s3.get('split', 'train') if _s3 else 'train'))
++                replay_dataset.save(replay_buffer, replay_path, extra={
++                    'tasks': list(tasks), 'demos': int(cfg.rlbench.demos),
++                    'planner_cache_dir': (_s3.get('planner_cache_dir', None) if _s3 else None),
++                    'split': (_s3.get('split', 'train') if _s3 else 'train'),
++                    'built_by': 'run_seed_fn (rank0)',
++                })
++            dist.barrier()
+ 
+         agent = peract_bc.launch_utils.create_agent(cfg)
+ 
+diff --git a/train.py b/train.py
+index 8d3a778..ab93c83 100644
+--- a/train.py
++++ b/train.py
+@@ -24,13 +24,44 @@ except RuntimeError:
+     pass
+ 
+ 
++def _free_port(addr: str, want: str) -> str:
++    """DDP 的 master port：配置里那个被占了就自动换一个空闲的。
++
++    🔴 并行跑两个训练时必踩。`conf/stage3.yaml` 的 master_port 写死 29500，
++    第二个作业起来时 `dist.init_process_group` 直接
++        RuntimeError: ... EADDRINUSE, address already in use
++    而且它是在 `mp.spawn` 的子进程里炸的，父进程只吐一大段
++    ProcessRaisedException，不点破真正原因 —— 实测因此白等了 35 分钟才发现
++    B3 续训根本没起来（B1 占着 29500）。
++
++    这里在 spawn **之前**探测：能绑上就用配置值（行为不变），
++    绑不上就从 want+1 往上找，并把换用的端口打进日志。
++    父进程设好 env，所有 rank 都继承同一个值，不会不一致。
++    """
++    import socket
++    base = int(want)
++    for port in range(base, base + 200):
++        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
++            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
++            try:
++                s.bind((addr if addr != 'localhost' else '', port))
++            except OSError:
++                continue
++        if port != base:
++            logging.warning('MASTER_PORT %d 已被占用（多半是另一个训练作业），'
++                            '改用 %d', base, port)
++        return str(port)
++    raise RuntimeError(f'从 {base} 起连续 200 个端口都被占用')
++
++
+ @hydra.main(config_name='config', config_path='conf')
+ def main(cfg: DictConfig) -> None:
+     cfg_yaml = OmegaConf.to_yaml(cfg)
+     logging.info('\n' + cfg_yaml)
+ 
+     os.environ['MASTER_ADDR'] = cfg.ddp.master_addr
+-    os.environ['MASTER_PORT'] = cfg.ddp.master_port
++    os.environ['MASTER_PORT'] = _free_port(cfg.ddp.master_addr,
++                                           str(cfg.ddp.master_port))
+ 
+     cfg.rlbench.cameras = cfg.rlbench.cameras \
+         if isinstance(cfg.rlbench.cameras, ListConfig) else [cfg.rlbench.cameras]
+diff --git a/voxel/voxel_grid.py b/voxel/voxel_grid.py
+index 55662e7..37f1dae 100644
+--- a/voxel/voxel_grid.py
++++ b/voxel/voxel_grid.py
+@@ -37,20 +37,20 @@ class VoxelGrid(nn.Module):
+             [torch.tensor([batch_size], ), max_dims,
+              torch.tensor([4 + feature_size], )], -1).tolist()
+ 
+-        self.register_buffer('_ones_max_coords', torch.ones((batch_size, max_num_coords, 1)))
++        self.register_buffer('_ones_max_coords', torch.ones((batch_size, max_num_coords, 1)), persistent=False)
+         self._num_coords = max_num_coords
+ 
+         shape = self._total_dims_list
+         result_dim_sizes = torch.tensor(
+             [reduce(mul, shape[i + 1:], 1) for i in range(len(shape) - 1)] + [1], )
+-        self.register_buffer('_result_dim_sizes', result_dim_sizes)
++        self.register_buffer('_result_dim_sizes', result_dim_sizes, persistent=False)
+         flat_result_size = reduce(mul, shape, 1)
+ 
+         self._initial_val = torch.tensor(0, dtype=torch.float)
+         flat_output = torch.ones(flat_result_size, dtype=torch.float) * self._initial_val
+-        self.register_buffer('_flat_output', flat_output)
++        self.register_buffer('_flat_output', flat_output, persistent=False)
+ 
+-        self.register_buffer('_arange_to_max_coords', torch.arange(4 + feature_size))
++        self.register_buffer('_arange_to_max_coords', torch.arange(4 + feature_size), persistent=False)
+         self._flat_zeros = torch.zeros(flat_result_size, dtype=torch.float)
+ 
+         self._const_1 = torch.tensor(1.0, )
+@@ -58,30 +58,30 @@ class VoxelGrid(nn.Module):
+ 
+         # Coordinate Bounds:
+         bb_mins = self._coord_bounds[..., 0:3]
+-        self.register_buffer('_bb_mins', bb_mins)
++        self.register_buffer('_bb_mins', bb_mins, persistent=False)
+         bb_maxs = self._coord_bounds[..., 3:6]
+         bb_ranges = bb_maxs - bb_mins
+         # get voxel dimensions. 'DIMS' mode
+         self._dims = dims = self._voxel_shape_spec.int()
+         dims_orig = self._voxel_shape_spec.int() - 2
+-        self.register_buffer('_dims_orig', dims_orig)
++        self.register_buffer('_dims_orig', dims_orig, persistent=False)
+ 
+         # self._dims_m_one = (dims - 1).int()
+         dims_m_one = (dims - 1).int()
+-        self.register_buffer('_dims_m_one', dims_m_one)
++        self.register_buffer('_dims_m_one', dims_m_one, persistent=False)
+ 
+         # BS x 1 x 3
+         res = bb_ranges / (dims_orig.float() + MIN_DENOMINATOR)
+         self._res_minis_2 = bb_ranges / (dims.float() - 2 + MIN_DENOMINATOR)
+-        self.register_buffer('_res', res)
++        self.register_buffer('_res', res, persistent=False)
+ 
+         voxel_indicy_denmominator = res + MIN_DENOMINATOR
+-        self.register_buffer('_voxel_indicy_denmominator', voxel_indicy_denmominator)
++        self.register_buffer('_voxel_indicy_denmominator', voxel_indicy_denmominator, persistent=False)
+ 
+-        self.register_buffer('_dims_m_one_zeros', torch.zeros_like(dims_m_one))
++        self.register_buffer('_dims_m_one_zeros', torch.zeros_like(dims_m_one), persistent=False)
+ 
+         batch_indices = torch.arange(self._batch_size, dtype=torch.int).view(self._batch_size, 1, 1)
+-        self.register_buffer('_tiled_batch_indices', batch_indices.repeat([1, self._num_coords, 1]))
++        self.register_buffer('_tiled_batch_indices', batch_indices.repeat([1, self._num_coords, 1]), persistent=False)
+ 
+         w = self._voxel_shape[0] + 2
+         arange = torch.arange(0, w, dtype=torch.float, )
+@@ -90,7 +90,7 @@ class VoxelGrid(nn.Module):
+             arange.view(1, w, 1, 1).repeat([w, 1, w, 1]),
+             arange.view(1, 1, w, 1).repeat([w, w, 1, 1])], dim=-1).unsqueeze(
+             0).repeat([self._batch_size, 1, 1, 1, 1])
+-        self.register_buffer('_index_grid', index_grid)
++        self.register_buffer('_index_grid', index_grid, persistent=False)
+ 
+     def _broadcast(self, src: torch.Tensor, other: torch.Tensor, dim: int):
+         if dim < 0:

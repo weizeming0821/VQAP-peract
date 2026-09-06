@@ -47,10 +47,20 @@ class Arm:
     train: bool          # 是否参与微调（B0 零训练）
     description: str
     isolates: str        # 该臂相对前一臂多出的那一样东西
+    # 码向量注入层版本，**臂是唯一真源**（不启用码的臂此字段无意义）。
+    # 曾经它只写在 conf/stage3.yaml 里，靠命令行 stage3.injector=v2 传进去 ——
+    # 那样一旦漏传，就会在 B4/ 目录下静默训出一个 v1 模型且不报任何错。
+    # 现在 launch_utils.create_agent 一律从这里读，配置里写了不一致的值直接抛异常。
+    injector: str = "v1"
 
     @property
     def uses_subtask_lang(self) -> bool:
         return self.lang == "subtask"
+
+    def __post_init__(self) -> None:
+        if self.injector not in ("v1", "v2"):
+            raise ValueError(
+                f"{self.name}: injector 只能是 v1/v2，收到 {self.injector!r}")
 
 
 ARMS: dict[str, Arm] = {
@@ -64,8 +74,17 @@ ARMS: dict[str, Arm] = {
               "子任务指令 + 微调 K 步",
               "Planner 的功劳（不计入 VQAP 贡献）"),
     "B3": Arm("B3", "subtask", True, True,
-              "子任务指令 + 码注入 + 微调 K 步",
-              "码本本身的功劳（核心主张）"),
+              "子任务指令 + v1 码注入（FiLM + 门控 cross-attn）+ 微调 K 步",
+              "码本本身的功劳（核心主张）",
+              injector="v1"),
+    # B4 = B3 的字段权限，只把注入层换成 v2（纯残差相加，无门控无 FiLM）。
+    # 为什么独立成臂而不是「改 logdir、arm 仍写 B3」：归档文件名、
+    # stage3_eval.py --arm、结果汇总表全靠臂名区分，混用一定出乱子；而且
+    # v1/v2 参数名不同，独立臂能让「拿 B3 的 ckpt 去续 B4」报错而非静默加载错。
+    "B4": Arm("B4", "subtask", True, True,
+              "子任务指令 + v2 码注入（纯残差相加，无门控无 FiLM）+ 微调 K 步",
+              "注入层形式（对照 B3：码相同、注入机制不同）",
+              injector="v2"),
 }
 
 
