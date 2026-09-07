@@ -283,23 +283,99 @@ reference verbatim.
     repetitions. That count is derived from the scene configuration and is
     reliable - do not try to count objects from the image yourself.
 
-ON THE PHRASINGS LIST
-When a list of trained phrasings is given, prefer reusing those exact strings
-whenever one of them describes the step you mean. They are the wording the
-downstream controller was actually trained on, and they carry the correct object
-names and colours for this scene. Write your own wording only when none of them
-fits - and then stay as close to their style and vocabulary as you can.
+ON THE PHRASINGS LIST - THIS IS A HARD PROTOCOL, NOT A SUGGESTION
+You are given a NUMBERED list of the exact instruction strings the downstream
+controller was trained on, for THIS task and THIS scene configuration.
+
+Measured on a previous run: only 45% of freely-written instructions matched the
+training wording, and the three tasks whose wording matched worst lost 34-40
+percentage points of success rate. Wording that is semantically perfect but
+phrased differently is an out-of-distribution input to the controller.
+
+For every step, pick ONE of three forms, strictly in this order of preference:
+
+  (A) REUSE - a listed phrasing describes your step as-is. Give its number:
+        {{"action": "grasp", "phrasing_id": 3}}
+
+  (B) SUBSTITUTE - a listed phrasing has the right shape but names a different
+      object, colour, ordinal or side than what you actually see. Keep its
+      sentence structure and replace only the differing words:
+        {{"action": "grasp", "phrasing_id": 3, "substitute": {{"red": "black"}}}}
+
+  (C) IMITATE - no listed phrasing covers this step at all. Write your own, but
+      IMITATE the patterns above: same grammar, same length, same vocabulary.
+      You may swap the verb, the adjectives and the nouns; do NOT invent a new
+      sentence shape, and do NOT add words the list never uses:
+        {{"action": "wipe", "instruction": "sweep dirt into the short dustpan"}}
+
+Always prefer (A) over (B) over (C). Use (C) only when the list genuinely does
+not cover the step - it exists so that actions outside the list are still
+expressible, not as an escape from (A)/(B).
 
 OUTPUT FORMAT - reply with exactly this shape and nothing else:
 {{"plan": [
-  {{"action": "grasp", "instruction": "grasp the grey jar lid"}},
-  {{"action": "lift", "instruction": "lift the grey jar lid"}},
-  {{"action": "transfer", "instruction": "move the lid over the red jar"}},
-  {{"action": "place", "instruction": "place the lid on the red jar"}}
+  {{"action": "grasp", "phrasing_id": 3}},
+  {{"action": "lift", "phrasing_id": 7}},
+  {{"action": "transfer", "phrasing_id": 11, "substitute": {{"red": "black"}}}},
+  {{"action": "place", "instruction": "place the lid on the black jar"}}
 ]}}
 
 Do your reasoning silently. Emit only the JSON object.
 """
+
+
+def render_attempt_log(history: list[dict] | None,
+                       decisions: list[dict] | None = None,
+                       budget: int | None = None) -> list[str]:
+    """把「已经尝试过什么」渲染成紧凑日志，供 PLAN 与 MONITOR 两个 prompt 共用。
+
+    🔴 措辞是 ATTEMPTED 不是 COMPLETED，这一条是踩过坑的：
+    重规划时曾把走过的段当成「已完成」喂回去，而实际上 grasp 失败了
+    （VLM 自己都说 "lid is on table, not held"），idx 却已经推到 5 ——
+    模型于是只规划了最后一步，计划直接废掉。画面才是判断完成与否的依据，
+    这份日志只负责回答「试过什么、各花了几帧、中途做过什么决策」。
+
+    没有它时的病：RETRY 回退之后 prompt 只显示 CURRENT=0，完全没有
+    「我已经试过第 1~4 步并且退回来了」的痕迹，于是 VLM 每次看到的输入都一样，
+    实测出现过连判 10 次同一句 "grasp failed" —— 判断次次正确，却没有依据改变做法。
+    """
+    if not history:
+        return []
+    # 把逐帧记录压成「段 -> 连续占用帧数」
+    runs: list[dict] = []
+    for h in history:
+        i = h.get("subtask_index")
+        if runs and runs[-1]["idx"] == i:
+            runs[-1]["n"] += 1
+        else:
+            runs.append({"idx": i, "n": 1,
+                         "action": h.get("action"),
+                         "instruction": h.get("instruction")})
+    # 决策按发生时刻挂到对应的段上
+    dec_by_idx: dict[int, list[str]] = {}
+    for d in (decisions or []):
+        if d.get("decision") in (None, "PLAN"):
+            continue
+        dec_by_idx.setdefault(d.get("idx"), []).append(
+            f"{d['decision']}" + (f' ("{str(d.get("reason"))[:60]}")'
+                                  if d.get("reason") else ""))
+    lines = ["", "what has been ATTEMPTED so far "
+                 "(NOT necessarily completed - judge that from the images):"]
+    for k, r in enumerate(runs):
+        lines.append(f"  [{r['idx']}] {r['action']}: {r['instruction']}"
+                     f"   - {r['n']} keyframe(s)"
+                     + ("   <- CURRENT" if k == len(runs) - 1 else ""))
+    flat = [x for v in dec_by_idx.values() for x in v]
+    if flat:
+        lines.append("  decisions made so far: " + "; ".join(flat[-6:]))
+    total = len(history)
+    lines.append(f"  total keyframes used: {total}"
+                 + (f" of about {budget} available" if budget else ""))
+    if len(runs) > 1 and any(runs[i]["idx"] < runs[i - 1]["idx"]
+                             for i in range(1, len(runs))):
+        lines.append("  NOTE: the plan has been rolled back at least once - "
+                     "repeating what already failed will not help.")
+    return lines
 
 
 def build_plan_user_content(task: str, task_instruction: str,
@@ -307,7 +383,10 @@ def build_plan_user_content(task: str, task_instruction: str,
                             done: list[dict] | None = None,
                             prior: list[str] | None = None,
                             n_repeat: int | None = None,
-                            phrasings: list[str] | None = None) -> list[dict]:
+                            phrasings: list[str] | None = None,
+                            history: list[dict] | None = None,
+                            decisions: list[dict] | None = None,
+                            budget: int | None = None) -> list[dict]:
     """images: [(view_name, data_url), ...]；done: 重规划时已完成的段。
 
     `prior` 是 `Phase_Action_Label.csv` 展开后的参考动作序列，`n_repeat` 是
@@ -333,17 +412,20 @@ def build_plan_user_content(task: str, task_instruction: str,
         lines.append("already completed:")
         lines += [f"  - {d['action']}: {d['instruction']}" for d in done]
         lines.append("Plan only the remaining steps.")
+    lines += render_attempt_log(history, decisions, budget)
     if phrasings:
         # 这些是**控制器真正训练时见过的原文**，取自同一 (task, variation)
-        # 的 train episode。实测在线规划注入的指令只有 56.6% 落在训练分布内
-        # （模板法 100%），未命中的里既有措辞变体，也有把物体/颜色认错的
-        # （"red coffee box"、场景里不存在的颜色）。给出候选清单既示范了
-        # 指令该长什么样，也钉住了这个场景里物体的正确名字与颜色。
+        # 的 train episode。实测自由生成时只有 45% 落在训练分布内（模板法
+        # 100%），而分布内比例最低的三个任务正是掉分最多的（−34 ~ −40 pp）。
+        # 🔴 必须**编号**：系统 prompt 里的三层协议要求按 phrasing_id 引用，
+        #    没有编号协议就无法执行。此前只给无序清单 + "prefer reusing"
+        #    的软措辞，实测 VLM 只学风格不照抄。
         lines.append("")
         lines.append("phrasings the controller was trained on, for THIS task "
                      "and THIS scene configuration (they also tell you the "
-                     "correct names and colours of the objects in front of you):")
-        lines += [f"  - {x}" for x in phrasings]
+                     "correct names and colours of the objects in front of you). "
+                     "Reference them by number - see the A/B/C protocol:")
+        lines += [f"  [{i}] {x}" for i, x in enumerate(phrasings)]
     content: list[dict] = [{"type": "text", "text": "\n".join(lines)}]
     for name, url in images:
         content.append({"type": "text", "text": f"{name} view of the current scene:"})
@@ -411,15 +493,23 @@ def build_monitor_user_content(task: str, task_instruction: str,
                                plan: list[dict], cur: int, used: int,
                                gripper_open, images: list[tuple[str, str]],
                                stalled: bool = False,
-                               quiet: str = "") -> list[dict]:
+                               quiet: str = "",
+                               history: list[dict] | None = None,
+                               decisions: list[dict] | None = None,
+                               budget: int | None = None) -> list[dict]:
     lines = [f"task: {task}",
              f"task instruction: {task_instruction}",
              f"gripper: {'open' if (gripper_open is None or gripper_open > 0.5) else 'closed'}",
              f"keyframes spent on the current step: {used}",
              "plan:"]
-    for i, s in enumerate(plan):
+    for i, st in enumerate(plan):
         mark = "   <-- CURRENT" if i == cur else ""
-        lines.append(f"  [{i}] {s['action']}: {s['instruction']}{mark}")
+        lines.append(f"  [{i}] {st['action']}: {st['instruction']}{mark}")
+    # 🔴 执行记忆。原来 MONITOR 只有 plan + "<-- CURRENT"，VLM 只能推断
+    #    「编号更小的应该做完了」，看不到「曾经走到第 4 步又退回第 0 步」。
+    #    实测因此出现连判 10 次同一句 "grasp failed, lid is on table" ——
+    #    判断次次正确，但每次输入都一样，没有依据改变做法。
+    lines += render_attempt_log(history, decisions, budget)
     if stalled or quiet:
         # 给 VLM **新信息**。v1 实测连判 6 次 REPLAN，每次生成几乎相同的计划 ——
         # 因为它每次看到的输入都一样，没有任何理由换个说法。

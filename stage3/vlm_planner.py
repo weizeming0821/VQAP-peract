@@ -245,7 +245,21 @@ QUIET_FRAMES = 2
 #: 每局的调用上限（成本护栏）。
 #: 🔴 实测 200 局：调用/局 中位 13、p90 15、max 22 —— 原来的 12 会在 **52%**
 #:    的局上触顶，等于一半的局中途失去 planner。按 p90 留余量取 25。
-MAX_CALLS = 25
+#: 🔴 HEARTBEAT=1（每个 waypoint 问一次）时**必须同步提高**：中位 episode 有
+#:    26 个关键帧，25 的上限会在多数局触顶，等于后半局失去 planner。
+MAX_CALLS = int(os.environ.get("AAVLA_PLANNER_MAX_CALLS", "25"))
+
+# ---------------------------------------------------------------- v3.2 开关
+# 三项改动各自独立，出问题可以逐项关掉重跑定位，不需要改代码。
+#: 指令来源：select = 三层协议（选编号 / 编号+替换 / 模仿句式自由生成）；
+#:           free   = v3.1 的自由生成（实测只有 45% 落在训练分布内）
+PHRASING_MODE = os.environ.get("AAVLA_PHRASING_MODE", "select")
+#: 是否把「已尝试过什么」喂进 PLAN 与 MONITOR 的 prompt
+USE_HISTORY = os.environ.get("AAVLA_PLANNER_HISTORY", "1") != "0"
+#: 是否启用备选先验（REPLAN / RETRY 用满时换一种分解）
+USE_PRIOR_VARIANTS = os.environ.get("AAVLA_PRIOR_VARIANTS", "1") != "0"
+#: 每局的关键帧预算，仅用于在 prompt 里告诉 VLM「还剩多少帧」
+EPISODE_BUDGET = int(os.environ.get("AAVLA_EPISODE_BUDGET", "26"))
 #: 同一段最多重试几次。实测 RETRY/局 中位 0、p90 3。
 MAX_RETRY = 4
 #: 每局最多重规划几次。实测 6% 的局触顶 2；v3 把停滞导向 REPLAN 后需求上升。
@@ -278,7 +292,13 @@ class OnlineVLMPlanner:
         self.task = task
         self.task_instruction = task_instruction
         self._client = client
-        self._prior = list(prior or [])
+        # 先验现在是**变体列表**：list[list[str]]。单变体任务自动包一层，
+        # 行为与原来逐位相同。走不通时 _next_variant() 换下一种分解。
+        pv = prior or []
+        if pv and isinstance(pv[0], str):          # 兼容旧的 list[str]
+            pv = [list(pv)]
+        self._prior_variants: list[list[str]] = [list(v) for v in pv] or [[]]
+        self._variant = 0
         self._n_repeat = n_repeat
         # 该 (task, variation) 的真实训练指令。作为软参考进 prompt：
         # 既示范指令该长什么样，也钉住这个场景里物体的正确名字与颜色。
@@ -306,6 +326,25 @@ class OnlineVLMPlanner:
                       "budget_exhausted": 0, "trigger_flip": 0,
                       "trigger_heartbeat": 0, "trigger_quiet": 0,
                       "trigger_stall": 0, "no_robot_state": 0}
+
+    # ---------------------------------------------------------- 先验变体
+    @property
+    def prior(self) -> list[str]:
+        """当前正在用的那个先验变体。"""
+        return self._prior_variants[self._variant]
+
+    def _next_variant(self) -> bool:
+        """换下一个先验变体；没有更多变体时返回 False。
+
+        触发时机是「这条路走不通」：REPLAN，或同一段 RETRY 用满。
+        实测 slide_block 的两种分解在 train 里分别占 6/10 与 4/10，
+        先试频次高的短版本，失败再试长版本。
+        """
+        if not USE_PRIOR_VARIANTS or self._variant + 1 >= len(self._prior_variants):
+            return False
+        self._variant += 1
+        self.stats["prior_variant_switch"] = self.stats.get("prior_variant_switch", 0) + 1
+        return True
 
     # ---------------------------------------------------------- 对外协议
     @property
@@ -454,6 +493,7 @@ class OnlineVLMPlanner:
                     self.retry = 0
                     return
             if self.retry > MAX_RETRY and self.idx < last:
+                self._next_variant()                # 同一段重试到底了，也算走不通
                 self.idx += 1                       # 原地重试太多次就放弃这一段
                 self.used = 0
                 self.retry = 0
@@ -465,6 +505,7 @@ class OnlineVLMPlanner:
                 self.stats["replan_blocked"] = self.stats.get("replan_blocked", 0) + 1
                 return
             self.n_replan += 1
+            self._next_variant()          # 这条分解走不通 -> 换一种再规划
             # 🔴 **不**把走过的段记成「已完成」。实测：grasp 明明失败了
             #    （VLM 自己都说 “lid is on table, not held”），但 idx 已经推到 5，
             #    于是 done 告诉 VLM「approach/grasp/lift/transfer/place 都做完了」，
@@ -493,12 +534,16 @@ class OnlineVLMPlanner:
     def _plan(self, frame: dict) -> list[dict]:
         from planner.prompts import (build_plan_system_prompt,
                                      build_plan_user_content)
-        from planner.contract import use_codebook, normalize_instruction
+        from planner.contract import (use_codebook, normalize_instruction,
+                                      NON_CODEBOOK_ACTIONS)
         msgs = [{"role": "system", "content": build_plan_system_prompt()},
                 {"role": "user", "content": build_plan_user_content(
                     self.task, self.task_instruction, self._images(frame),
-                    done=self.done or None, prior=self._prior,
-                    n_repeat=self._n_repeat, phrasings=self._phrasings)}]
+                    done=self.done or None, prior=self.prior,
+                    n_repeat=self._n_repeat, phrasings=self._phrasings,
+                    history=self.history if USE_HISTORY else None,
+                    decisions=self.decisions if USE_HISTORY else None,
+                    budget=EPISODE_BUDGET if USE_HISTORY else None)}]
         self.stats["plan_call"] += 1
         try:
             raw = _parse_plan(self._client.chat(msgs)["content"])
@@ -508,9 +553,18 @@ class OnlineVLMPlanner:
                                f"本局评测中止。") from e
         plan = []
         for st in raw:
-            ins = normalize_instruction(st["instruction"])
+            ins, layer = _resolve_phrasing(st["raw"], self._phrasings)
+            ins = normalize_instruction(ins)
+            # 三层各用了多少次 —— 直接对应「指令是否落在训练分布内」，
+            # 事后不必再去逐条比对字符串就能看出协议有没有被遵守。
+            self.stats[f"phrasing_{layer}"] = self.stats.get(f"phrasing_{layer}", 0) + 1
+            uc = bool(use_codebook(st["action"]))
+            if not uc and st["action"] not in NON_CODEBOOK_ACTIONS:
+                # 词表外动作：安全降级为不用码本（code_mask=0，注入层恒等），
+                # 语言通路照常。这里只记账，不拦截 —— 实测当前 0/755。
+                self.stats["off_vocab_action"] = self.stats.get("off_vocab_action", 0) + 1
             plan.append({"action": st["action"], "instruction": ins,
-                         "use_codebook": bool(use_codebook(st["action"])),
+                         "use_codebook": uc,
                          "k_global": -1, "k_detail": [-1] * 9,  # 必须由 Adapter 出
                          "n_keyframes": 1})
         if not plan:
@@ -528,7 +582,10 @@ class OnlineVLMPlanner:
                 {"role": "user", "content": build_monitor_user_content(
                     self.task, self.task_instruction, self.subtasks, self.idx,
                     self.used, gripper_open, self._images(frame),
-                    stalled=stalled, quiet=quiet)}]
+                    stalled=stalled, quiet=quiet,
+                    history=self.history if USE_HISTORY else None,
+                    decisions=self.decisions if USE_HISTORY else None,
+                    budget=EPISODE_BUDGET if USE_HISTORY else None)}]
         self.stats["monitor_call"] += 1
         try:
             out = self._client.chat(msgs)
@@ -537,6 +594,40 @@ class OnlineVLMPlanner:
             self.stats["fail"] += 1
             raise PlannerError(f"vlm-plan 进度判定失败（{type(e).__name__}: {e}）。"
                                f"本局评测中止。") from e
+
+
+def _resolve_phrasing(item: dict, phrasings: list[str]) -> tuple[str, str]:
+    """把一条计划项解析成 (instruction, 使用了哪一层)。
+
+    三层协议（见 planner/prompts.py 的 "ON THE PHRASINGS LIST"）：
+      A  {"phrasing_id": 3}                        直接复用训练原文
+      B  {"phrasing_id": 3, "substitute": {...}}   复用句式，替换 variation 词
+      C  {"instruction": "..."}                    模仿句式自由生成
+
+    候选条目的格式是 "action: instruction"（`_load_phrasings` 如此产出），
+    解析时要把 action 前缀切掉。
+    """
+    pid = item.get("phrasing_id")
+    if pid is not None and phrasings:
+        try:
+            raw = phrasings[int(pid)]
+        except (ValueError, TypeError, IndexError):
+            raw = None
+        if raw is not None:
+            ins = raw.split(":", 1)[1].strip() if ":" in raw else raw.strip()
+            sub = item.get("substitute") or {}
+            if isinstance(sub, dict) and sub:
+                for a, b in sub.items():
+                    # 整词替换，避免 "red" 命中 "predict" 这类子串
+                    ins = re.sub(rf"\b{re.escape(str(a))}\b", str(b), ins,
+                                 flags=re.IGNORECASE)
+                return ins, "B"
+            return ins, "A"
+    ins = item.get("instruction")
+    if not ins:
+        raise PlannerError(
+            f"计划项既没有可解析的 phrasing_id 也没有 instruction: {item!r}")
+    return str(ins).strip(), "C"
 
 
 def _parse_plan(text: str) -> list[dict]:
@@ -555,8 +646,8 @@ def _parse_plan(text: str) -> list[dict]:
         if d is None:
             raise PlannerError(f"计划输出里找不到 JSON: {s[:120]!r}")
     plan = d["plan"] if isinstance(d, dict) else d
-    return [{"action": str(x["action"]).strip(),
-             "instruction": str(x["instruction"]).strip()} for x in plan]
+    # instruction 的解析推迟到 _plan()（那里才拿得到候选清单）
+    return [{"action": str(x["action"]).strip(), "raw": x} for x in plan]
 
 
 _DECISIONS = ("CONTINUE", "NEXT", "RETRY", "REPLAN")
@@ -612,8 +703,8 @@ class OnlinePlanFactory:
     @property
     def priors(self):
         if self._priors is None:
-            from planner.offline import load_priors
-            self._priors = load_priors()
+            from planner.offline import load_prior_variants
+            self._priors = load_prior_variants()
             if self._verbose:
                 print(f"[planner] kind=vlm-plan model={self.model} "
                       f"views={','.join(self.views)}；"
@@ -646,8 +737,10 @@ class OnlinePlanFactory:
         from planner.contract import expand_prior, n_repeat_prior
         d = episode_descriptions(task, self.split, episode)
         var = episode_variation(task, self.split, episode)
-        prior = (expand_prior(task, var, self.priors.get(task, []))
-                 if var is not None else self.priors.get(task, []))
+        # priors[task] 是变体列表；逐个展开（重复次数按 variation 推）后整体传下去
+        variants = self.priors.get(task, [[]])
+        prior = [(expand_prior(task, var, v) if var is not None else list(v))
+                 for v in variants]
         nrep = n_repeat_prior(task, var) if var is not None else None
         return OnlineVLMPlanner(
             task, d[0] if d else task.replace("_", " "), self.client,

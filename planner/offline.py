@@ -35,8 +35,32 @@ TASK_PRIOR_ALIAS = {
 PRIOR_OVERRIDE = {
     "put_groceries_in_cupboard": ["approach", "grasp", "lift", "pose-adjust",
                                   "pose-adjust", "place"],
+    # 🔴 slide_block 的这条**保持原样不动**，尽管它已被证明与训练分布不符
+    #    （动作词 press 应为 push，段数 5 应为 1）。原因是可复现性：
+    #    scripts/planner_cache.py 用 load_priors() 建离线 cache，而那份 cache
+    #    是已冻结的训练工件（三臂共享的 replay 就是从它来的）。改这里等于让
+    #    「重建 cache」产出与训练时不同的东西 —— 这类静默漂移正是本项目反复
+    #    吃亏的地方。修正只作用于**在线** planner，见下面的 PRIOR_VARIANTS。
     "slide_block_to_color_target": ["approach", "press", "pose-adjust",
                                     "approach", "press"],
+}
+
+#: 备选先验：同一任务的**多种合理分解**，在线 planner 走不通时可以换一个。
+#:
+#: 🔴 slide_block_to_color_target 是本项目已知的三方不一致（HANDOFF #5）：
+#:      CSV 先验            5 段，且动作词写成 press
+#:      离线真值            平均 2.7 段
+#:      train 模板库        最常见是**单个 push**（6/10 局），
+#:                          次常见是 5 段版（4/10 局）
+#:    原来的 PRIOR_OVERRIDE 只给了 5 段版、动作词还是错的 `press`。
+#:    实测在线 planner 忠实照它生成 5 段，而模板法只有 1 段，成绩 64 → 30。
+#:
+#:    变体顺序按训练分布的频次排：先试更常见的短版本，走不通再切长版本。
+PRIOR_VARIANTS: dict[str, list[list[str]]] = {
+    "slide_block_to_color_target": [
+        ["push"],                                                  # train 6/10
+        ["approach", "push", "pose-adjust", "approach", "push"],   # train 4/10
+    ],
 }
 
 
@@ -54,7 +78,25 @@ def load_priors(csv_path: Path | None = None) -> dict[str, list[str]]:
         if old in prior:
             prior.setdefault(new, prior[old])
     prior.update(PRIOR_OVERRIDE)
+    # 🔴 这里**不**套用 PRIOR_VARIANTS —— load_priors() 的返回值必须与建
+    #    离线 cache 时逐位一致（scripts/planner_cache.py 依赖它）。
+    #    在线 planner 走 load_prior_variants()，那边才是修正后的顺序。
     return prior
+
+
+def load_prior_variants(csv_path: Path | None = None) -> dict[str, list[list[str]]]:
+    """`{task: [变体0, 变体1, ...]}`。没登记备选的任务返回单元素列表。
+
+    在线 planner 用它做「这条路走不通就换一种分解」：REPLAN 或 RETRY 用满时
+    切到下一个变体。离线建 cache 不用它（离线有完整 demo，不需要试错）。
+    """
+    base = load_priors(csv_path)
+    out: dict[str, list[list[str]]] = {}
+    for t, p in base.items():
+        # 登记了变体的任务用变体列表（顺序按 train 里的频次），其余包一层。
+        # 与 load_priors() 的差异是**有意的**：离线要复现，在线要修正。
+        out[t] = [list(v) for v in PRIOR_VARIANTS[t]] if t in PRIOR_VARIANTS else [list(p)]
+    return out
 
 
 def parse_json(text: str) -> dict[str, Any]:
