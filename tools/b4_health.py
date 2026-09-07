@@ -65,6 +65,8 @@ INJECT_OK, INJECT_WARN = 0.03, 0.01      # ① 注入幅度
 MOVE_OK, MOVE_FAIL = 0.01, 0.001         # ② 相邻 ckpt 相对变化
 LOSS_RATIO_WARN = 1.5                    # ③ loss 相对基线臂的倍数
 LOSS_CHECK_FROM = 10000                  # ③ 从这一步起才判 loss
+LOSS_HALF_WINDOW = 1000                  # ③ 平滑半窗（步）；见 smoothed_loss 的量化理由
+LOSS_STREAK = 2                          # ③ 连续几个 ckpt 超标才算数（单点必是噪声）
 
 VERDICT_RANK = {"OK": 0, "WARN": 1, "FAIL": 2}
 
@@ -114,10 +116,23 @@ def rel_change(a: dict, b: dict) -> float:
     return (num.sqrt() / den.sqrt()).item() if den > 0 else 0.0
 
 
-def smoothed_loss(arm: str, step: int, window: int = 5) -> float | None:
-    """train_data.csv 里 step 附近若干行的 total_loss 均值。
+def smoothed_loss(arm: str, step: int, half_window: int = LOSS_HALF_WINDOW
+                  ) -> float | None:
+    """train_data.csv 里 step ±half_window 内 total_loss 的**中位数**。
 
-    单步 loss 噪声极大（batch=4/卡，实测在 3~17 之间跳），必须平滑后再比。
+    🔴 窗口和统计量都是量出来的，不是拍的。实测 step 10000~25000 区间：
+
+        B4  中位数 3.49  标准差 1.82  范围 [0.41, 11.76]
+        B2  中位数 3.44  标准差 1.85  范围 [0.59, 10.07]
+
+    单行相对噪声约 50%、极值相差 28 倍（batch=4/卡，单步 loss 本就极不稳）。
+    最初用「最近 5 行的均值」平滑，样本太少又被极值拖着走 —— 结果 step
+    12500/15000 报了 1.62×/2.05× 的 WARN，而那两处其实是**基线臂 B2 恰好
+    落在低谷**（3.87 / 2.51），B4 自己并没有升。误报会让人对判据失去信任，
+    比不报还糟。
+
+    现在：±1000 步（21 行）+ 中位数。同口径重算，B4/B2 的比值在 1.0 附近
+    振荡，step 17500 之后稳定在 0.8 左右（B4 反而更低）。
     """
     f = CKPT_ROOT / arm / "seed0" / "train_data.csv"
     if not f.is_file():
@@ -130,11 +145,11 @@ def smoothed_loss(arm: str, step: int, window: int = 5) -> float | None:
                 rows.append((int(r["step"]), float(r[col])))
             except (KeyError, ValueError, TypeError):
                 continue
-    if not rows:
+    near = sorted(v for s, v in rows if abs(s - step) <= half_window)
+    if not near:
         return None
-    rows.sort()
-    near = sorted(rows, key=lambda t: abs(t[0] - step))[:window]
-    return sum(v for _, v in near) / len(near)
+    n = len(near)
+    return near[n // 2] if n % 2 else (near[n // 2 - 1] + near[n // 2]) / 2
 
 
 def main() -> int:
@@ -171,7 +186,7 @@ def main() -> int:
     print(f"    {'step':>7}  {'注入幅度':>9}  {'相邻变化':>9}  "
           f"{'loss':>7}  {'基线loss':>8}  判定")
 
-    worst, prev = "OK", None
+    worst, prev, loss_streak = "OK", None, 0
     for s in steps:
         sd = injector_state(arm, s)
         notes = []
@@ -222,12 +237,16 @@ def main() -> int:
         if lo is not None and (lo != lo or lo in (float("inf"), float("-inf"))):
             notes.append("loss 出现 NaN/Inf")
             v = "FAIL"
-        elif (lo and lb and s >= LOSS_CHECK_FROM
-              and lo > lb * LOSS_RATIO_WARN):
-            notes.append(f"loss {lo:.2f} 是 {a.baseline} 的 {lo/lb:.2f} 倍 —— "
-                         f"起点扰动没恢复过来")
-            if v == "OK":
-                v = "WARN"
+        elif lo and lb and s >= LOSS_CHECK_FROM:
+            # 单点超标一律不算 —— 平滑后仍有 ±30% 的起伏，单点必是噪声。
+            # 连续 LOSS_STREAK 个 ckpt 都超标，才说明是趋势。
+            loss_streak = loss_streak + 1 if lo > lb * LOSS_RATIO_WARN else 0
+            if loss_streak >= LOSS_STREAK:
+                notes.append(f"loss {lo:.2f} 是 {a.baseline} 的 {lo/lb:.2f} 倍，"
+                             f"且已连续 {loss_streak} 个 ckpt 超标 —— "
+                             f"起点扰动没恢复过来")
+                if v == "OK":
+                    v = "WARN"
 
         print(f"    {s:>7}  {amp:>8.2%}  "
               + (f"{mv:>8.3%}" if prev is not None else f"{'—':>9}")
