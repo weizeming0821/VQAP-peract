@@ -250,6 +250,56 @@ def cmd_unhold(a) -> int:
     return 0
 
 
+def cmd_pick(a) -> int:
+    """输出这次作业可以用的卡号（逗号分隔），直接喂给 stage3_eval.py --gpu。
+
+    两层，对应用户 2026-09-07 定的策略：
+
+      固定层  盘子里的 4 张 —— hold 名单 + 我们自己已在跑的卡。
+              这些由 watch/handoff 维持，别人拿不走。
+
+      机会层  --opportunistic 时追加：当前空闲 > --min-free 且**卡上没有
+              别人进程**的其余卡。只是加进候选列表，**不起占位、不写
+              hold/state** —— 作业进程自然分配、退出即释放，别人随时能拿走。
+
+    为什么机会层不占显存：占了就等于把盘子从 4 张变大，违反「总共 4 张」；
+    而且评测的 GPU 利用率近 0%（瓶颈在 CPU 侧的运动规划与仿真），
+    多占并不会更快，只会挡住别人。
+
+    ⚠️ 机会卡随时可能被别人占走。这不会造成静默错误：分片有分卡预检，
+    合并时逐任务查值，缺任务就以非零码退出（坑 #4 的既有防线）。
+    """
+    state = prune(load_state())
+    holds = load_holds()
+    st = gpu_state()
+
+    plate = {int(g) for g in holds} | {int(g) for g in state} | {
+        r["index"] for r in st if is_ours(r["index"])}
+    picked = sorted(plate)
+
+    extra = []
+    if a.opportunistic:
+        for r in st:
+            g = r["index"]
+            if g in plate or others_on(g) or r["free"] < a.min_free:
+                continue
+            extra.append(g)
+        extra.sort(key=lambda g: -next(r["free"] for r in st if r["index"] == g))
+        extra = extra[:a.max_extra]
+
+    if a.verbose:
+        print(f"  盘子 {picked}"
+              + (f" + 机会卡 {sorted(extra)}"
+                 f"（空闲 >{a.min_free//1024} GB 且无别人进程；不占位，用完即释放）"
+                 if extra else "  （无可借用的空闲卡）"), file=sys.stderr)
+    out = picked + sorted(extra)
+    if not out:
+        print("❌ 一张可用的卡都没有", file=sys.stderr)
+        return 1
+    print(",".join(str(g) for g in out))
+    return 0
+
+
 def cmd_watch(a) -> int:
     """把「我们能用的卡」实时补齐到 MAX_CARDS 张。
 
@@ -303,6 +353,14 @@ def main() -> int:
     p = sub.add_parser("watch"); p.add_argument("--interval", type=int, default=60)
     p.set_defaults(fn=cmd_watch)
     sub.add_parser("status").set_defaults(fn=cmd_status)
+    p = sub.add_parser("pick", help="输出可用卡号（逗号分隔），喂给 --gpu")
+    p.add_argument("--opportunistic", action="store_true",
+                   help="追加当前空闲且无别人进程的卡（不占位，用完即释放）")
+    p.add_argument("--min-free", type=int, default=FREE_THRESHOLD_MIB,
+                   help="机会卡的空闲显存下限（MiB）")
+    p.add_argument("--max-extra", type=int, default=4, help="最多借几张")
+    p.add_argument("--verbose", action="store_true", help="把说明打到 stderr")
+    p.set_defaults(fn=cmd_pick)
     p = sub.add_parser("hold", help="把卡留给作业：释放占位并禁止看门程序再占")
     p.add_argument("--gpus", required=True, help="逗号分隔，如 2,3")
     p.set_defaults(fn=cmd_hold)
