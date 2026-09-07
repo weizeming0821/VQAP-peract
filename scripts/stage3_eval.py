@@ -223,6 +223,11 @@ def _eval_once(exp: str, arm: str, tasks: list[str], split: str, episodes: int,
 #: 单个评测进程的显存占用（8 路并行实测 32705 MiB / 8）。留 15% 余量。
 EVAL_MEM_MB = 4100
 EVAL_MEM_MARGIN = 1.15
+#: 卡上有**别人**的进程时，给他们留出的不动用显存。
+#: 机会卡策略允许与别人共用一张卡（只要显存够），但共用不等于吃满 ——
+#: 别人的作业显存占用会随 batch/阶段波动，我们把余量吃光就会把他们挤爆。
+#: 8 GB 是经验值：够别人的训练做一次显存峰值波动。
+OTHERS_KEEP_MB = 8 * 1024
 
 
 def gpu_free_mb() -> dict[int, int]:
@@ -248,6 +253,18 @@ def plan_gpus(n_shards: int, allow: list[int] | None = None) -> list[str] | None
     free = gpu_free_mb()
     if allow:
         free = {i: v for i, v in free.items() if i in allow}
+    # 共用卡上给别人留余量（OTHERS_KEEP_MB），绝不把卡吃满把别人挤爆。
+    try:
+        from tools.gpu_reserver import others_on
+        shared = {i for i in free if others_on(i)}
+    except Exception:                        # 取不到就按「都是共用卡」保守处理
+        shared = set(free)
+    if shared:
+        print("  共用卡 " + ",".join(f"GPU{i}" for i in sorted(shared))
+              + f"：各预留 {OTHERS_KEEP_MB} MiB 给别人，不吃满")
+        free = {i: (v - OTHERS_KEEP_MB if i in shared else v)
+                for i, v in free.items()}
+        free = {i: v for i, v in free.items() if v > 0}
     need = int(EVAL_MEM_MB * EVAL_MEM_MARGIN)
     # 每张卡能放几个；**跨卡轮转**而不是填满一张再填下一张 ——
     # 这些卡上通常跑着别人的训练，摊开能把干扰降到最低

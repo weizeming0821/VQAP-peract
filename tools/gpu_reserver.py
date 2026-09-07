@@ -50,6 +50,11 @@ FREE_THRESHOLD_MIB = 30 * 1024
 KEEP_FREE_MIB = 4 * 1024
 #: 最多同时占几张（用户设定）
 MAX_CARDS = 4
+#: 机会卡的空闲显存下限。单个评测分片实测 4,100 MiB（+15% 余量 = 4,715），
+#: 这里取约 2 个分片 —— 再低就不值得为它多起一路分片了。
+#: 注意它与 FREE_THRESHOLD_MIB 是两回事：后者管「占位要不要占这张卡」，
+#: 门槛高（30 GB）是因为占位会长期霸着卡；机会卡用完即走，门槛可以低得多。
+OPPORTUNISTIC_MIN_FREE_MIB = 10 * 1024
 
 
 def gpu_state() -> list[dict]:
@@ -258,9 +263,14 @@ def cmd_pick(a) -> int:
       固定层  盘子里的 4 张 —— hold 名单 + 我们自己已在跑的卡。
               这些由 watch/handoff 维持，别人拿不走。
 
-      机会层  --opportunistic 时追加：当前空闲 > --min-free 且**卡上没有
-              别人进程**的其余卡。只是加进候选列表，**不起占位、不写
-              hold/state** —— 作业进程自然分配、退出即释放，别人随时能拿走。
+      机会层  --opportunistic 时追加：当前空闲 ≥ --min-free 的其余卡，
+              **允许与别人共用同一张卡**（用户 2026-09-07 放宽：只要显存
+              够跑我们的任务就行）。只是加进候选列表，**不起占位、不写
+              hold/state** —— 作业进程自然分配、退出即释放。
+
+              共用卡的显存安全由**下游**保证：stage3_eval.plan_gpus 对
+              「卡上有别人进程」的卡预留 OTHERS_KEEP_MB 不动，绝不把卡吃满
+              把别人挤爆。这里只负责挑出候选。
 
     为什么机会层不占显存：占了就等于把盘子从 4 张变大，违反「总共 4 张」；
     而且评测的 GPU 利用率近 0%（瓶颈在 CPU 侧的运动规划与仿真），
@@ -281,7 +291,8 @@ def cmd_pick(a) -> int:
     if a.opportunistic:
         for r in st:
             g = r["index"]
-            if g in plate or others_on(g) or r["free"] < a.min_free:
+            # 不再排除「卡上有别人进程」的卡 —— 显存够就能共用。
+            if g in plate or r["free"] < a.min_free:
                 continue
             extra.append(g)
         extra.sort(key=lambda g: -next(r["free"] for r in st if r["index"] == g))
@@ -290,7 +301,8 @@ def cmd_pick(a) -> int:
     if a.verbose:
         print(f"  盘子 {picked}"
               + (f" + 机会卡 {sorted(extra)}"
-                 f"（空闲 >{a.min_free//1024} GB 且无别人进程；不占位，用完即释放）"
+                 f"（空闲 ≥{a.min_free//1024} GB；可与别人共用，"
+                 f"下游对共用卡预留 8 GB；不占位，用完即释放）"
                  if extra else "  （无可借用的空闲卡）"), file=sys.stderr)
     out = picked + sorted(extra)
     if not out:
@@ -356,8 +368,8 @@ def main() -> int:
     p = sub.add_parser("pick", help="输出可用卡号（逗号分隔），喂给 --gpu")
     p.add_argument("--opportunistic", action="store_true",
                    help="追加当前空闲且无别人进程的卡（不占位，用完即释放）")
-    p.add_argument("--min-free", type=int, default=FREE_THRESHOLD_MIB,
-                   help="机会卡的空闲显存下限（MiB）")
+    p.add_argument("--min-free", type=int, default=OPPORTUNISTIC_MIN_FREE_MIB,
+                   help="机会卡的空闲显存下限（MiB）；默认够放 2 个评测分片")
     p.add_argument("--max-extra", type=int, default=4, help="最多借几张")
     p.add_argument("--verbose", action="store_true", help="把说明打到 stderr")
     p.set_defaults(fn=cmd_pick)
