@@ -40,9 +40,24 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from yarr.agents.agent import ActResult
 from yarr.utils.rollout_generator import RolloutGenerator
 
 from stage3.online_planner import PlannerError
+
+# ------------------------------------------------------------ v3.4 位置回退
+#: RETRY 时把机械臂送回该子任务**首次进入时实际到达**的位姿。
+#: 待检验的假设：抓取失败后手臂停在训练分布外的位姿（夹爪闭合、悬在半空），
+#: PerAct 面对的观测 OOD；回到锚点能把观测拉回分布内。
+#: 🔴 风险：额外动作若触发 IKError / ConfigurationPathError /
+#:    InvalidActionError，`custom_rlbench_env.step` 会置 terminal=True ——
+#:    **整局立刻结束记 0 分**。所以默认关闭，每局限次，且逐次记账，
+#:    事后要能算出「回退救回的局」与「回退打死的局」谁多。
+RETRY_ROLLBACK = os.environ.get("AAVLA_RETRY_ROLLBACK", "0") != "0"
+ROLLBACK_MAX = int(os.environ.get("AAVLA_ROLLBACK_MAX", "3"))
+#: 回退路径是否忽略碰撞检查。开着更不容易抛 ConfigurationPathError，
+#: 代价是可能蹭到物体；关掉更安全但更容易把整局打死。
+ROLLBACK_IGNORE_COLL = os.environ.get("AAVLA_ROLLBACK_IGNORE_COLL", "1") != "0"
 
 
 def task_name_of(env) -> str:
@@ -98,6 +113,12 @@ class _SubtaskAgent:
         views = set(getattr(planner, "_views", ()) or ())
         views |= set(getattr(code_source, "views", ()) or ())
         self._views = tuple(sorted(views))
+        # ---- v3.4 仪表 + 位置回退 ----
+        self._last_wp = None                   # 上一帧下发的目标点 xyz
+        self._anchor: dict[int, np.ndarray] = {}   # 子任务下标 → 首次进入时的位姿
+        self._pending_rollback: int | None = None
+        self._rollback_log: list[dict] = []
+        planner.rollback_log = self._rollback_log  # _dump 只拿得到 planner
 
     def __getattr__(self, name):          # reset / update_summaries / act_summaries …
         return getattr(self._inner, name)
@@ -107,6 +128,18 @@ class _SubtaskAgent:
         # 第一次调用面对的是初始状态，没有「上一个动作」可评判，
         # 所以只建立夹爪基线（prime）而不推进。
         g = _gripper_open(observation)
+        robot = self._robot_state() if self._robot_state else None
+        # 实际到达的末端位姿（7 维 xyz+quat）。它是「上一条指令有没有被执行
+        # 到位」的唯一直接证据 —— 与上一帧下发的目标点相减就是 gap。
+        achieved = None
+        if robot:
+            p = robot.get("gripper_pose")
+            if p is not None and len(p) >= 7:
+                achieved = np.asarray(p, dtype=np.float32)
+        gap = (float(np.linalg.norm(self._last_wp - achieved[:3]))
+               if self._last_wp is not None and achieved is not None else None)
+
+        idx_before = getattr(self._planner, "idx", 0)
         if self._first:
             self._first = False
             # vlm-plan 要在第一帧就现场规划，所以 prime 也得拿到画面。
@@ -116,11 +149,30 @@ class _SubtaskAgent:
         else:
             # 只有需要看画面的 planner（在线 VLM）才付图像抽取的开销；
             # 模板法是开环的，用不到。
+            # gap 随 robot 一起带进去（不改 observe 签名 —— 模板法也实现它）。
+            rb = robot
+            if rb is not None and gap is not None:
+                rb = dict(rb)
+                rb["gap"] = gap
             self._planner.observe(
                 g,
                 _frames(observation, self._views) if self._views else None,
-                robot=self._robot_state() if self._robot_state else None)
+                robot=rb)
         self._planner.note(step)
+
+        idx_after = getattr(self._planner, "idx", 0)
+        # 锚点：某个子任务**首次进入**时实际站在哪里。只认真正到达过的位姿，
+        # 不认 PerAct 想去的目标点 —— 前者至少曾经可达。
+        if achieved is not None and idx_after not in self._anchor:
+            self._anchor[idx_after] = np.concatenate(
+                [achieved[:7],
+                 [1.0 if (g is None or g > 0.5) else 0.0],
+                 [1.0 if ROLLBACK_IGNORE_COLL else 0.0]]).astype(np.float32)
+        # 回退触发：planner 把段位往回拨了（RETRY），且该段有锚点、未超限。
+        if (RETRY_ROLLBACK and idx_after < idx_before
+                and len(self._rollback_log) < ROLLBACK_MAX
+                and idx_after in self._anchor):
+            self._pending_rollback = idx_after
 
         st = self._planner.current
         dev = _device_of(observation)
@@ -140,7 +192,51 @@ class _SubtaskAgent:
             obs["subtask_code_mask"] = torch.as_tensor(
                 [[1.0 if st["use_codebook"] else 0.0]], device=dev,
                 dtype=torch.float32)
-        return self._inner.act(step, obs, deterministic)
+
+        if self._pending_rollback is not None:
+            j, self._pending_rollback = self._pending_rollback, None
+            a = self._anchor[j].copy()
+            self._rollback_log.append({
+                "t": len(self._planner.history), "to_index": j,
+                "from_xyz": ([round(float(x), 4) for x in achieved[:3]]
+                             if achieved is not None else None),
+                "to_xyz": [round(float(x), 4) for x in a[:3]],
+                "dist": (round(float(np.linalg.norm(achieved[:3] - a[:3])), 4)
+                         if achieved is not None else None),
+            })
+            self._note_frame(gap, achieved, a[:3], rollback=True)
+            self._last_wp = a[:3].copy()
+            # 这一帧不问 PerAct：直接把机械臂送回锚点。
+            return ActResult(a)
+
+        res = self._inner.act(step, obs, deterministic)
+        wp = None
+        try:
+            wp = np.asarray(res.action[:3], dtype=np.float32)
+        except Exception:
+            pass
+        self._note_frame(gap, achieved, wp, rollback=False)
+        self._last_wp = wp
+        return res
+
+    def _note_frame(self, gap, achieved, wp, rollback: bool) -> None:
+        """把「下发了哪个目标点 / 实际到了哪里 / 差多远」写进本帧轨迹。
+
+        没有这三个量就无法区分「动作做完了所以停」与「根本没走到所以停」——
+        planner 现在只能靠看图猜，猜错的证据在 v3.3 的轨迹里满地都是。
+        """
+        h = getattr(self._planner, "history", None)
+        if not h:
+            return
+        e = h[-1]
+        if gap is not None:
+            e["gap"] = round(gap, 4)
+        if achieved is not None:
+            e["achieved"] = [round(float(x), 4) for x in achieved[:3]]
+        if wp is not None:
+            e["waypoint"] = [round(float(x), 4) for x in wp[:3]]
+        if rollback:
+            e["rollback"] = True
 
     def _codes_for(self, st: dict, observation) -> tuple[int, list[int]]:
         """取当前子任务的码。
@@ -276,6 +372,10 @@ class Stage3RolloutGenerator(RolloutGenerator):
             if hasattr(planner, "stats"):
                 rec["vlm_stats"] = planner.stats
                 rec["vlm_decisions"] = getattr(planner, "decisions", [])
+            # v3.4：回退必须逐次留痕 —— 它可能救回一局，也可能因运动规划
+            # 失败直接把整局判死（terminal=True），两者只能用记录分辨。
+            rec["rollback_on"] = RETRY_ROLLBACK
+            rec["rollbacks"] = getattr(planner, "rollback_log", [])
             (self._trace_dir / f"{task}_ep{episode}.json").write_text(
                 json.dumps(rec, ensure_ascii=False))
         except Exception as e:                       # 诊断数据不该拖垮评测
