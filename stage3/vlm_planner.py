@@ -260,6 +260,41 @@ USE_HISTORY = os.environ.get("AAVLA_PLANNER_HISTORY", "1") != "0"
 USE_PRIOR_VARIANTS = os.environ.get("AAVLA_PRIOR_VARIANTS", "1") != "0"
 #: 每局的关键帧预算，仅用于在 prompt 里告诉 VLM「还剩多少帧」
 EPISODE_BUDGET = int(os.environ.get("AAVLA_EPISODE_BUDGET", "26"))
+#: 是否按动作语义解释夹爪状态变化（v3.3）
+USE_GRIPPER_SEMANTICS = os.environ.get("AAVLA_GRIPPER_SEMANTICS", "1") != "0"
+
+#: 夹爪状态变化在不同原子动作下的含义完全不同 —— 逐条取自
+#: `planner/prompts.py` 的 ACTION_DEFINITIONS 原文。
+#:
+#:   boundary  夹爪开合**就是这一步的完成标志**
+#:             grasp「closes, firmly fixing the object」
+#:             place「brings the bottom of the object into contact with the surface」
+#:
+#:   tool      夹爪是**工具或准备姿态**，闭合发生在动作过程中，不代表完成
+#:             push 「end effector (usually **closed** or in a specific posture)
+#:                    applies horizontal pressure」
+#:             transfer「if the gripper **releases at the very end** of a transfer,
+#:                    that release ... still counts as transfer」
+#:             approach「does NOT involve any physical contact」—— 本不该有变化
+#:
+#:   hold      定义里明写全程保持抓握，松开多半意味着**脱手**
+#:             lift「maintaining a stable grip」· rotate「without loosening」
+#:             pull「keeps the grasp unchanged」· wipe「stably grasps」…
+#:
+#: 🔴 这是 slide_block 归零的直接原因：`approach` 阶段夹爪为「推」而闭合，
+#:    被当成边界信号，t=1 就推进，之后一路震荡到 26 步没做成。
+GRIPPER_SEMANTICS: dict[str, str] = {
+    **{a: "boundary" for a in ("grasp", "place")},
+    **{a: "tool" for a in ("approach", "push", "press", "revolve-in", "transfer")},
+    **{a: "hold" for a in ("lift", "rotate", "pull", "slide", "wipe", "insert",
+                           "hang", "flip-open", "flip-close", "revolve-out")},
+    "pose-adjust": "tool",          # 定义即「未持物时的姿态修正」
+}
+
+
+def gripper_class(action: str) -> str:
+    """该动作下夹爪变化的含义；未知动作按 boundary 处理（保持旧行为）。"""
+    return GRIPPER_SEMANTICS.get(action, "boundary")
 #: 同一段最多重试几次。实测 RETRY/局 中位 0、p90 3。
 MAX_RETRY = 4
 #: 每局最多重规划几次。实测 6% 的局触顶 2；v3 把停滞导向 REPLAN 后需求上升。
@@ -394,6 +429,12 @@ class OnlineVLMPlanner:
         stalled = self.used > STALL_LIMIT
         at_last = self.idx >= last0
         why = ""
+        gclass = gripper_class(self.current["action"]) if USE_GRIPPER_SEMANTICS else "boundary"
+        if flip and gclass == "tool" and USE_GRIPPER_SEMANTICS:
+            # 工具类动作：闭合是准备姿态，不是完成信号 —— 不为它单独发问，
+            # 但记账，便于事后确认这条规则拦下了多少次误触发。
+            self.stats["flip_suppressed"] = self.stats.get("flip_suppressed", 0) + 1
+            flip = False
         if flip and not at_last:
             why = "gripper_flip"
         elif stalled:
@@ -418,7 +459,8 @@ class OnlineVLMPlanner:
         self.last_ask = self.t
 
         d, tgt, reason = self._monitor(gripper_open, frame,
-                                       stalled=stalled, quiet=quiet)
+                                       stalled=stalled, quiet=quiet,
+                                       gripper_class=gclass if flip else "")
         self.stats[d] = self.stats.get(d, 0) + 1
         self.decisions.append({"t": self.t, "trigger": why, "decision": d,
                                "idx": self.idx, "target": tgt, "reason": reason})
@@ -575,14 +617,14 @@ class OnlineVLMPlanner:
         return plan
 
     def _monitor(self, gripper_open, frame: dict, stalled: bool = False,
-                 quiet: str = "") -> tuple[str, int | None, str]:
+                 quiet: str = "", gripper_class: str = "") -> tuple[str, int | None, str]:
         from planner.prompts import (build_monitor_system_prompt,
                                      build_monitor_user_content)
         msgs = [{"role": "system", "content": build_monitor_system_prompt()},
                 {"role": "user", "content": build_monitor_user_content(
                     self.task, self.task_instruction, self.subtasks, self.idx,
                     self.used, gripper_open, self._images(frame),
-                    stalled=stalled, quiet=quiet,
+                    stalled=stalled, quiet=quiet, gripper_class=gripper_class,
                     history=self.history if USE_HISTORY else None,
                     decisions=self.decisions if USE_HISTORY else None,
                     budget=EPISODE_BUDGET if USE_HISTORY else None)}]

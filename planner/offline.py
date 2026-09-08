@@ -57,9 +57,13 @@ PRIOR_OVERRIDE = {
 #:
 #:    变体顺序按训练分布的频次排：先试更常见的短版本，走不通再切长版本。
 PRIOR_VARIANTS: dict[str, list[list[str]]] = {
+    # 🔴 顺序在 2026-09-08 反转过。原来把单段 ["push"] 放在变体 0，依据是
+    #    **train split 的众数统计**（6/10 是单段）。但评测真正使用的是 val 的
+    #    模板计划，那里 variation 0/1 都是**5 段**，而模板法在该任务上拿了 64 分。
+    #    实测把在线 planner 推到 2 段后，成绩直接归零 —— 方向反了。
     "slide_block_to_color_target": [
-        ["push"],                                                  # train 6/10
-        ["approach", "push", "pose-adjust", "approach", "push"],   # train 4/10
+        ["approach", "push", "pose-adjust", "approach", "push"],   # val 模板同款
+        ["push"],                                                  # 备选：单段
     ],
 }
 

@@ -82,9 +82,35 @@ def main() -> int:
     p = mk(["NEXT"], heartbeat=99)          # 心跳关掉，只看夹爪
     p.observe(1.0, FRAME)
     check("夹爪没变、未到心跳 -> 不调用", p.stats["monitor_call"] == 0)
-    p.observe(0.0, FRAME)                   # 翻转
-    check("夹爪翻转 -> 调用一次", p.stats["monitor_call"] == 1)
-    check("触发原因记为 flip", p.stats["trigger_flip"] == 1)
+    # 🔴 v3.3：夹爪变化的含义取决于当前动作。默认计划第 0 段是 `approach`，
+    #    属 **tool** 类（定义里明说不接触物体、闭合只是准备姿态），
+    #    所以翻转**不该**触发 —— 这正是 slide_block 归零的那个误触发。
+    p.observe(0.0, FRAME)                   # 翻转，但当前是 approach(tool)
+    check("tool 类动作(approach)：夹爪翻转不触发",
+          p.stats["monitor_call"] == 0 and p.stats.get("flip_suppressed") == 1,
+          f'calls={p.stats["monitor_call"]} suppressed={p.stats.get("flip_suppressed")}')
+
+    # boundary 类（grasp）：翻转就是完成信号，必须触发
+    grasp_first = [{"action": "grasp", "instruction": "grasp the red block"},
+                   {"action": "lift", "instruction": "lift the red block"}]
+    p2 = mk(["NEXT"], plan=grasp_first, heartbeat=99)
+    p2.observe(1.0, FRAME)
+    p2.observe(0.0, FRAME)
+    check("boundary 类动作(grasp)：夹爪翻转触发", p2.stats["monitor_call"] == 1,
+          str(p2.stats["monitor_call"]))
+
+    # hold 类（lift）：应全程保持抓握，松开多半是脱手 -> 也要问，但提示 RETRY
+    lift_first = [{"action": "lift", "instruction": "lift the red block"},
+                  {"action": "place", "instruction": "place the red block down"}]
+    # prime(1.0) 已把基线设成「张开」，所以第一次 observe(0.0) 就是一次翻转
+    p3 = mk(["RETRY"], plan=lift_first, heartbeat=99)
+    p3.observe(0.0, FRAME)                  # 抓握中途状态改变 = 疑似脱手
+    check("hold 类动作(lift)：夹爪变化触发", p3.stats["monitor_call"] == 1,
+          str(p3.stats["monitor_call"]))
+    check("触发原因记为 flip", p2.stats.get("trigger_flip") == 1,
+          str(p2.stats.get("trigger_flip")))
+    check("tool 类不计入 trigger_flip", p.stats.get("trigger_flip", 0) == 0,
+          str(p.stats.get("trigger_flip")))
 
     p = mk(["CONTINUE"], heartbeat=3)
     for _ in range(3):

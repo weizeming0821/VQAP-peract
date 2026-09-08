@@ -494,6 +494,7 @@ def build_monitor_user_content(task: str, task_instruction: str,
                                gripper_open, images: list[tuple[str, str]],
                                stalled: bool = False,
                                quiet: str = "",
+                               gripper_class: str = "",
                                history: list[dict] | None = None,
                                decisions: list[dict] | None = None,
                                budget: int | None = None) -> list[dict]:
@@ -505,6 +506,26 @@ def build_monitor_user_content(task: str, task_instruction: str,
     for i, st in enumerate(plan):
         mark = "   <-- CURRENT" if i == cur else ""
         lines.append(f"  [{i}] {st['action']}: {st['instruction']}{mark}")
+    # 🔴 夹爪变化的含义取决于当前动作 —— 同一个信号在三类动作下意思完全相反。
+    #    实测 slide_block：approach 阶段夹爪为「推」而闭合，被当成完成信号，
+    #    t=1 就推进，之后一路震荡到 26 步，该任务成绩 0（模板法 64）。
+    if gripper_class:
+        hint = {
+            "boundary": "The gripper just changed state. For this action that "
+                        "IS normally the completion signal - check the images "
+                        "and advance if the object is now held / released.",
+            "hold": "The gripper just changed state, but this action is defined "
+                    "as keeping a STABLE GRIP throughout. A release here most "
+                    "likely means the object was DROPPED, not that the step "
+                    "finished - prefer RETRY over NEXT unless the images clearly "
+                    "show the goal was reached.",
+            "tool": "The gripper just changed state, but for this action the "
+                    "gripper is a tool / preparatory posture - closing is part "
+                    "of doing the step, NOT a sign that it finished.",
+        }.get(gripper_class)
+        if hint:
+            lines.append("")
+            lines.append("GRIPPER NOTE: " + hint)
     # 🔴 执行记忆。原来 MONITOR 只有 plan + "<-- CURRENT"，VLM 只能推断
     #    「编号更小的应该做完了」，看不到「曾经走到第 4 步又退回第 0 步」。
     #    实测因此出现连判 10 次同一句 "grasp failed, lid is on table" ——

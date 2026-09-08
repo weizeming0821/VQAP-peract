@@ -112,9 +112,13 @@ check("MONITOR 里有执行记忆", "ATTEMPTED" in mon)
 print("=== 4. 先验变体 ===")
 t = "slide_block_to_color_target"
 check("slide_block 登记了 2 个变体", len(PRIOR_VARIANTS[t]) == 2)
-check("变体 0 是训练里更常见的单段 push", PRIOR_VARIANTS[t][0] == ["push"],
+# 🔴 2026-09-08 反转：依据从「train 众数（单段）」改成「val 模板计划（5 段）」——
+#    评测真正使用的是后者，且模板法在该任务上拿了 64 分；把在线 planner 推到
+#    2 段后成绩直接归零，说明原来的方向反了。
+check("变体 0 与 val 模板同款（5 段）", len(PRIOR_VARIANTS[t][0]) == 5,
       str(PRIOR_VARIANTS[t][0]))
-check("变体 1 是 5 段版", len(PRIOR_VARIANTS[t][1]) == 5)
+check("变体 1 是备选的单段 push", PRIOR_VARIANTS[t][1] == ["push"],
+      str(PRIOR_VARIANTS[t][1]))
 check("动作词是 push 不是 press（原 override 写错了）",
       "press" not in PRIOR_VARIANTS[t][1], str(PRIOR_VARIANTS[t][1]))
 # 🔴 离线与在线**有意不同**：load_priors() 必须与建离线 cache 时逐位一致
@@ -123,17 +127,17 @@ check("动作词是 push 不是 press（原 override 写错了）",
 check("离线 load_priors 保持原样（可复现性）",
       load_priors()[t] == ["approach", "press", "pose-adjust", "approach", "press"],
       str(load_priors()[t]))
-check("在线变体 0 才是修正后的 push", load_prior_variants()[t][0] == ["push"],
-      str(load_prior_variants()[t][0]))
+check("在线变体 0 动作词是 push 不是 press",
+      "press" not in load_prior_variants()[t][0], str(load_prior_variants()[t][0]))
 var = load_prior_variants()
 check("只有 slide_block 是多变体",
       [k for k, v in var.items() if len(v) > 1] == [t])
 check("其余任务仍是单变体列表", len(var["close_jar"]) == 1)
 
 pl = OnlineVLMPlanner(t, "slide the block", None, prior=PRIOR_VARIANTS[t])
-check("开局用变体 0", pl.prior == ["push"], str(pl.prior))
+check("开局用变体 0（5 段）", pl.prior == PRIOR_VARIANTS[t][0], str(pl.prior))
 check("切换成功", pl._next_variant() is True)
-check("切换后是变体 1", pl.prior == PRIOR_VARIANTS[t][1], str(pl.prior))
+check("切换后是变体 1（单段）", pl.prior == ["push"], str(pl.prior))
 check("没有更多变体时返回 False", pl._next_variant() is False)
 check("切换次数被记账", pl.stats.get("prior_variant_switch") == 1,
       str(pl.stats.get("prior_variant_switch")))
@@ -141,6 +145,25 @@ check("切换次数被记账", pl.stats.get("prior_variant_switch") == 1,
 pl2 = OnlineVLMPlanner("close_jar", "close the red jar", None, prior=["grasp", "lift"])
 check("旧的 list[str] 先验仍兼容", pl2.prior == ["grasp", "lift"], str(pl2.prior))
 check("单变体不切换", pl2._next_variant() is False)
+
+print("=== 5. v3.3 夹爪语义分类 ===")
+from stage3.vlm_planner import gripper_class          # noqa: E402
+for a, want in (("grasp", "boundary"), ("place", "boundary"),
+                ("push", "tool"), ("press", "tool"), ("approach", "tool"),
+                ("transfer", "tool"), ("pose-adjust", "tool"),
+                ("lift", "hold"), ("wipe", "hold"), ("rotate", "hold")):
+    check(f"{a} -> {want}", gripper_class(a) == want, gripper_class(a))
+check("未知动作按 boundary（保持旧行为）", gripper_class("no_such_action") == "boundary")
+from planner.prompts import build_monitor_user_content as _B    # noqa: E402
+_t = _B("x", "x", [{"action": "lift", "instruction": "lift it"}], 0, 3, 1.0, [],
+        gripper_class="hold")[0]["text"]
+check("hold 类提示里建议 RETRY", "RETRY" in _t and "DROPPED" in _t)
+_t = _B("x", "x", [{"action": "push", "instruction": "push it"}], 0, 3, 1.0, [],
+        gripper_class="tool")[0]["text"]
+check("tool 类提示说明闭合不代表完成", "NOT a sign that it finished" in _t)
+check("不给 gripper_class 时不加提示",
+      "GRIPPER NOTE" not in _B("x", "x", [{"action": "push", "instruction": "p"}],
+                               0, 3, 1.0, [])[0]["text"])
 
 print("\nv3.2 单测: " + ("PASS" if OK else "FAIL"))
 raise SystemExit(0 if OK else 1)
