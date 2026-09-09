@@ -54,6 +54,15 @@ from stage3.online_planner import PlannerError
 #:    **整局立刻结束记 0 分**。所以默认关闭，每局限次，且逐次记账，
 #:    事后要能算出「回退救回的局」与「回退打死的局」谁多。
 RETRY_ROLLBACK = os.environ.get("AAVLA_RETRY_ROLLBACK", "0") != "0"
+# ---------------------------------------------------- 码本覆盖门控（分析用）
+#: 这些任务不在 AtomAction_Dataset 里 —— 码本从未见过它们的原子动作，
+#: 注入的码是无意义的。逗号分隔的任务名；置空则关闭门控。
+#: 🔴 **实验性质，不是最终架构**：只用来验证「未覆盖任务上的码是负作用」
+#:    这个假设。实测（B4@40000 · val · 两次独立测量）：
+#:      覆盖的 8 个任务   B4 − B1 = +3.00 pp
+#:      未覆盖的 4 个任务 B4 − B1 = -11.00 pp（两次分别 -13 / -9）
+#:    合起来正好抵消成 -0.33 pp，这就是 B4 看起来「和 B1 没差别」的来源。
+CODE_GATE_OFF = tuple(x for x in os.environ.get("AAVLA_CODE_GATE_OFF", "").split(",") if x)
 ROLLBACK_MAX = int(os.environ.get("AAVLA_ROLLBACK_MAX", "3"))
 #: 回退路径是否忽略碰撞检查。开着更不容易抛 ConfigurationPathError，
 #: 代价是可能蹭到物体；关掉更安全但更容易把整局打死。
@@ -94,8 +103,12 @@ class _SubtaskAgent:
     """薄包装：在 `act()` 前推进状态机并注入子任务字段，其余全部透传。"""
 
     def __init__(self, inner, planner, tokens: TokenCache,
-                 with_codes: bool, code_source=None, robot_state=None) -> None:
+                 with_codes: bool, code_source=None, robot_state=None,
+                 task: str = "") -> None:
         self._inner = inner
+        self._task = task
+        #: 该任务是否被门控掉码本（码本未覆盖它的原子动作）
+        self._gated = task in CODE_GATE_OFF
         self._planner = planner
         self._tokens = tokens
         self._with_codes = with_codes
@@ -189,8 +202,11 @@ class _SubtaskAgent:
                 [[kg]], device=dev, dtype=torch.long)
             obs["subtask_k_detail"] = torch.as_tensor(
                 [[kd]], device=dev, dtype=torch.long)
+            # 门控：码本没见过这个任务的原子动作时，mask=0（注入层恒等），
+            # 语言通路照常 —— 与 pose-adjust 段的处理方式相同，训练时见过。
+            use_cb = st["use_codebook"] and not self._gated
             obs["subtask_code_mask"] = torch.as_tensor(
-                [[1.0 if st["use_codebook"] else 0.0]], device=dev,
+                [[1.0 if use_cb else 0.0]], device=dev,
                 dtype=torch.float32)
 
         if self._pending_rollback is not None:
@@ -337,7 +353,8 @@ class Stage3RolloutGenerator(RolloutGenerator):
         planner = self._factory(task, eval_demo_seed)
         wrapped = _SubtaskAgent(agent, planner, self._tokens, self._with_codes,
                                 self._code_source,
-                                robot_state=lambda: getattr(env, "_planner_state", None))
+                                robot_state=lambda: getattr(env, "_planner_state", None),
+                                task=task)
         self.last_planner = planner          # 供事后分析取 history
         try:
             yield from super().generator(
@@ -378,6 +395,7 @@ class Stage3RolloutGenerator(RolloutGenerator):
             rec["rollbacks"] = getattr(planner, "rollback_log", [])
             # 断线退化过的局必须可识别，否则成绩单里混着模板法的步骤而看不出来。
             rec["plan_source"] = getattr(planner, "plan_source", "vlm")
+            rec["code_gated"] = task in CODE_GATE_OFF
             # v3.5：续写了什么、第几次 —— 事后要能算出「续写过的局」成功率，
             # 不行就用 AAVLA_ALLOW_EXTEND=0 关掉。
             rec["extends"] = getattr(planner, "extends", [])

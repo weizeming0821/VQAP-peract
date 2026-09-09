@@ -309,6 +309,37 @@ GRIPPER_SEMANTICS: dict[str, str] = {
 }
 
 
+_DWELL_CACHE: dict | None = None
+
+
+def load_dwell_prior() -> dict:
+    """→ {task: {action: 最短停留关键帧数}}，取自 train split 的中位数。
+
+    只用 train，不碰 val/test —— 这是先验，不是标签。
+    """
+    global _DWELL_CACHE
+    if _DWELL_CACHE is not None:
+        return _DWELL_CACHE
+    import statistics, collections
+    path = REPO_ROOT / "aavla_data" / "planner_cache" / "plans_train_template.json"
+    out: dict = {}
+    try:
+        plans = json.loads(path.read_text())["plans"]
+        acc = collections.defaultdict(list)
+        for key, v in plans.items():
+            task = key.split("/")[0]
+            for seg in v["subtasks"]:
+                acc[(task, seg["action"])].append(int(seg.get("n_keyframes", 1)))
+        for (task, action), vals in acc.items():
+            med = int(statistics.median(vals))
+            if med >= 2:                       # 只记 >1 的，其余默认 1
+                out.setdefault(task, {})[action] = med
+    except Exception:
+        out = {}                               # 先验缺失就退回旧行为
+    _DWELL_CACHE = out
+    return out
+
+
 def gripper_class(action: str) -> str:
     """该动作下夹爪变化的含义；未知动作按 boundary 处理（保持旧行为）。"""
     return GRIPPER_SEMANTICS.get(action, "boundary")
@@ -329,6 +360,21 @@ MAX_EXTEND = int(os.environ.get("AAVLA_MAX_EXTEND", "2"))
 MAX_SEGMENTS = int(os.environ.get("AAVLA_MAX_SEGMENTS", "10"))
 #: 是否允许续写。关掉即退化成 v3.4 行为（末段 NEXT 仍为空操作）。
 ALLOW_EXTEND = os.environ.get("AAVLA_ALLOW_EXTEND", "1") != "0"
+# ------------------------------------------------------------------ v3.6
+#: 每段的**最短停留关键帧数**，来自 train split 的真实分段统计。
+#: 🔴 由来：sweep 与 reach_and_drag 两个任务在 v3.4/v3.5 上都比模板法跌
+#:    18~36 pp，且跌幅跨版本重现（不是噪声，也不是 v3.4/v3.5 的机制造成的
+#:    —— EXTEND 在 sweep 上触发 0 次）。逐局对照发现成功与失败的差别精确
+#:    地就是「多推进了一段」：
+#:        sweep 成功局到达段位 2.2 / 失败局 3.0
+#:        drag  成功局到达段位 2.1 / 失败局 3.1
+#:    而模板计划带着每段的真实关键帧数（sweep 的 transfer 要待 2 帧），
+#:    X3 自己生成的计划里 n_keyframes 一律是 1 —— 这个先验被丢掉了。
+#:    这两个任务的完成信号在图像上不可见（扫帚划过灰尘、方块被拖动，
+#:    「正在做」和「做完了」看起来一样），VLM 只能猜，必然早推。
+#:  规则完全条件式：train 统计里中位 ≥2 的 (task, action) 只有 7 个组合，
+#:  其余全部为 1 —— 对它们规则永不触发，行为逐字不变。
+MIN_DWELL = os.environ.get("AAVLA_MIN_DWELL", "1") != "0"
 
 
 class OnlineVLMPlanner:
@@ -354,7 +400,8 @@ class OnlineVLMPlanner:
                  phrasings: list[str] | None = None,
                  views=DEFAULT_VIEWS, img_size: int = 224,
                  heartbeat: int = HEARTBEAT,
-                 fallback: list[dict] | None = None) -> None:
+                 fallback: list[dict] | None = None,
+                 dwell: dict | None = None) -> None:
         self.task = task
         self.task_instruction = task_instruction
         self._client = client
@@ -393,6 +440,7 @@ class OnlineVLMPlanner:
         self.code_epoch = 0              # NEXT/RETRY/REPLAN 时 +1 -> 让 Adapter 重算
         self.retry = 0
         self.n_replan = 0
+        self._dwell = dict(dwell or {})   # v3.6：{action: 最短停留帧数}
         self.n_extend = 0                # v3.5：续写过几次
         self.extends: list[dict] = []    # 每次续写追加了什么，供事后判定有效性
         self._plan_exhausted = False     # 续写预算用尽 + 仍在末段 -> 停止再问
@@ -570,6 +618,14 @@ class OnlineVLMPlanner:
         if d == "NEXT" and self.idx >= last:
             self.stats["next_at_last"] = self.stats.get("next_at_last", 0) + 1
             d = "EXTEND" if ALLOW_EXTEND else "CONTINUE"
+        if d == "NEXT" and MIN_DWELL and self._dwell:
+            need = self._dwell.get(self.subtasks[self.idx]["action"], 1)
+            if self.used < need:
+                # 该段的真实分段统计要求至少待 need 帧，而现在还没待够。
+                # 这两个任务的完成信号在图像上不可见，VLM 判 NEXT 不可靠 ——
+                # 按 CONTINUE 处理（停在本段），并记账。
+                self.stats["next_too_early"] = self.stats.get("next_too_early", 0) + 1
+                return
         if d == "NEXT":
             if self.idx < last:
                 # 允许一次跨多段（上限 MAX_ADVANCE）。v1 每次只能进 1 段，
@@ -923,7 +979,8 @@ class OnlinePlanFactory:
             task, d[0] if d else task.replace("_", " "), self.client,
             prior=prior, n_repeat=nrep,
             phrasings=self.phrasings(task, var), views=self.views,
-            fallback=self.fallback(task, episode))
+            fallback=self.fallback(task, episode),
+            dwell=load_dwell_prior().get(task))
 
     def fallback(self, task: str, episode: int) -> list[dict] | None:
         """API 断线时的兜底：该 (task, episode) 的模板计划。
