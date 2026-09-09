@@ -376,6 +376,8 @@ class Stage3RolloutGenerator(RolloutGenerator):
             # 失败直接把整局判死（terminal=True），两者只能用记录分辨。
             rec["rollback_on"] = RETRY_ROLLBACK
             rec["rollbacks"] = getattr(planner, "rollback_log", [])
+            # 断线退化过的局必须可识别，否则成绩单里混着模板法的步骤而看不出来。
+            rec["plan_source"] = getattr(planner, "plan_source", "vlm")
             (self._trace_dir / f"{task}_ep{episode}.json").write_text(
                 json.dumps(rec, ensure_ascii=False))
         except Exception as e:                       # 诊断数据不该拖垮评测

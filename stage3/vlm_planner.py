@@ -31,14 +31,26 @@ Adapter 与 PerAct 的训练分布内。
 每片约 260 次串行调用。`PlannerClient` 按 sha256(model + messages) 磁盘记忆化，
 所以**重跑同一份评测不再付费，且结果逐位可复现**。
 
-# 失败即报错，不做静默退化
+# 失败要退化，但**必须留痕**
 
-VLM 调用失败（超时、限流、返回不可解析）直接抛错，让这一局评测失败。
+早先这里写的是「失败即报错，不做静默退化」，理由是：静默退化会让「VLM 方案」
+的成绩单里混进模板法产生的步骤，数字说不清是什么。这个理由本身是对的，
+但当时的实现把它推到了另一个极端 —— 抛 `PlannerError`，而 YARR 的
+`_run_eval_independent` 会把异常继续往上抛，于是**整个分片死掉**。
 
-早先的版本是「失败就退回模板法的推进规则」，那是**错的设计**：退化是静默的，
-最后拿到一份「VLM 方案」的成绩单，里面可能混着大量实际由模板法产生的步骤，
-数字说不清是什么。`PlannerClient` 本身带 4 次指数退避重试，真到了抛错这一步，
-说明服务确实不可用 —— 那就该停下来修，而不是偷偷换一套规则继续跑。
+2026-09-09 实测：一次 `APIConnectionError` 让 12 个分片分别在第 7~24 局
+被打死，300 局只跑出 126 局，且 `eval_data.csv` 合并出 0 行。
+单局的网络抖动不该让同一任务剩下的二十局陪葬。
+
+现在的做法是**退化 + 留痕**，两者缺一不可：
+  - PLAN 失败   → 回落到模板计划把这一局跑完，轨迹里记 `plan_source=
+                  "template_fallback"`，`stats["plan_fallback"]` 计数
+  - MONITOR 失败 → 退化成 CONTINUE（停在当前段），记 `monitor_fallback`
+  - 连续失败 2 次 → 判定 API 断线，本局不再发起调用（否则每次都要走满
+                  4 次重试 ×指数退避 ≈ 30 s，实测把速度拖到 25.8 s/局）
+
+关键区别：退化过的局在轨迹里**可识别**，分析时能整局剔除或单独对照，
+所以成绩单仍然说得清。静默的是旧实现，不是这一版。
 """
 
 from __future__ import annotations
@@ -254,8 +266,13 @@ MAX_CALLS = int(os.environ.get("AAVLA_PLANNER_MAX_CALLS", "25"))
 #: 指令来源：select = 三层协议（选编号 / 编号+替换 / 模仿句式自由生成）；
 #:           free   = v3.1 的自由生成（实测只有 45% 落在训练分布内）
 PHRASING_MODE = os.environ.get("AAVLA_PHRASING_MODE", "select")
-#: 是否把「已尝试过什么」喂进 PLAN 与 MONITOR 的 prompt
-USE_HISTORY = os.environ.get("AAVLA_PLANNER_HISTORY", "1") != "0"
+#: 是否把「已尝试过什么」喂进 PLAN 与 MONITOR 的 prompt。
+#: 🔴 默认**关**。实测（B3@40000 · val 120 局）：
+#:      开 = v3.2a 26.67%，REPLAN 爆到 173 次
+#:      关 = v3.2c 33.33%，REPLAN 降到 6 次
+#:    喂执行记忆会让 VLM 反复推翻自己的计划。默认值曾经是「开」，也就是
+#:    已知最差的配置 —— 不带环境变量直接跑就会静默拿到它，没有任何报错。
+USE_HISTORY = os.environ.get("AAVLA_PLANNER_HISTORY", "0") != "0"
 #: 是否启用备选先验（REPLAN / RETRY 用满时换一种分解）
 USE_PRIOR_VARIANTS = os.environ.get("AAVLA_PRIOR_VARIANTS", "1") != "0"
 #: 每局的关键帧预算，仅用于在 prompt 里告诉 VLM「还剩多少帧」
@@ -323,10 +340,22 @@ class OnlineVLMPlanner:
                  prior: list[str] | None = None, n_repeat: int | None = None,
                  phrasings: list[str] | None = None,
                  views=DEFAULT_VIEWS, img_size: int = 224,
-                 heartbeat: int = HEARTBEAT) -> None:
+                 heartbeat: int = HEARTBEAT,
+                 fallback: list[dict] | None = None) -> None:
         self.task = task
         self.task_instruction = task_instruction
         self._client = client
+        # 🔴 API 断线时的兜底计划（模板库的子任务序列）。
+        #    没有它时一次 APIConnectionError 会抛 PlannerError，而 YARR 的
+        #    _run_eval_independent 直接把异常再抛出去 —— **整个分片死掉**，
+        #    该任务剩余的局全部丢失。2026-09-09 实测：12 个分片各自在
+        #    7~24 局处被断线打死，300 局只跑出 126 局。
+        self._fallback = list(fallback) if fallback else None
+        self.plan_source = "vlm"
+        #: 连续失败到一定次数就停止再调 VLM —— 否则每次调用都要走满
+        #: 4 次重试 ×指数退避 ≈ 30 s，一局能拖到几十分钟（实测 25.8 s/局）。
+        self._consec_fail = 0
+        self._api_down = False
         # 先验现在是**变体列表**：list[list[str]]。单变体任务自动包一层，
         # 行为与原来逐位相同。走不通时 _next_variant() 换下一种分解。
         pv = prior or []
@@ -448,6 +477,11 @@ class OnlineVLMPlanner:
         #    纯粹浪费调用。停滞/静止仍要问，因为那时可能需要 RETRY/REPLAN。
         if not why:
             return                                   # 不触发就沿用当前段
+        if self._api_down:
+            # API 已判定断线：本局不再发起调用，沿用当前段把局跑完。
+            self.stats["skipped_while_down"] = \
+                self.stats.get("skipped_while_down", 0) + 1
+            return
         n_calls = self.stats["plan_call"] + self.stats["monitor_call"]
         if n_calls >= MAX_CALLS:
             self.stats["budget_exhausted"] += 1
@@ -591,6 +625,19 @@ class OnlineVLMPlanner:
             raw = _parse_plan(self._client.chat(msgs)["content"])
         except Exception as e:
             self.stats["fail"] += 1
+            if self._fallback:
+                # 断线不该让整个分片陪葬：用模板计划把这一局跑完，并在轨迹里
+                # 标记来源，分析时可以单独剔除或对照。
+                self.stats["plan_fallback"] = self.stats.get("plan_fallback", 0) + 1
+                self.plan_source = "template_fallback"
+                self._api_down = True
+                print(f"[planner] ⚠ PLAN 调用失败（{type(e).__name__}），"
+                      f"回落到模板计划：{self.task}", flush=True)
+                self.decisions.append({"t": self.t, "decision": "PLAN",
+                                       "source": "template_fallback",
+                                       "plan": [f"{s['action']}: {s['instruction']}"
+                                                for s in self._fallback]})
+                return [dict(s) for s in self._fallback]
             raise PlannerError(f"vlm-plan 规划失败（{type(e).__name__}: {e}）。"
                                f"本局评测中止。") from e
         plan = []
@@ -631,11 +678,21 @@ class OnlineVLMPlanner:
         self.stats["monitor_call"] += 1
         try:
             out = self._client.chat(msgs)
+            self._consec_fail = 0
             return _parse_decision(out["content"])
         except Exception as e:
             self.stats["fail"] += 1
-            raise PlannerError(f"vlm-plan 进度判定失败（{type(e).__name__}: {e}）。"
-                               f"本局评测中止。") from e
+            # 进度判定失败不再中止整局：退化成 CONTINUE（停在当前段），
+            # 局照常跑完。连续失败两次就判定 API 已断，本局不再发起调用 ——
+            # 否则每次都要走满重试+退避，一局能拖几十分钟。
+            self._consec_fail += 1
+            if self._consec_fail >= 2:
+                self._api_down = True
+                self.stats["api_down"] = self.stats.get("api_down", 0) + 1
+                print(f"[planner] ⚠ MONITOR 连续失败，本局停止调用 VLM："
+                      f"{self.task}", flush=True)
+            self.stats["monitor_fallback"] = self.stats.get("monitor_fallback", 0) + 1
+            return "CONTINUE", None, f"api_error:{type(e).__name__}"
 
 
 def _resolve_phrasing(item: dict, phrasings: list[str]) -> tuple[str, str]:
@@ -736,6 +793,7 @@ class OnlinePlanFactory:
         self._client = None
         self._priors = None
         self._phr = None
+        self._bank = None                            # 断线兜底用的模板计划
         if not os.environ.get("DASHSCOPE_API_KEY"):
             raise PlannerError(
                 "vlm-plan 需要 DASHSCOPE_API_KEY / DASHSCOPE_BASE_URL。"
@@ -771,6 +829,7 @@ class OnlinePlanFactory:
         d["_client"] = None                          # 持有 socket
         d["_priors"] = None
         d["_phr"] = None                             # 子进程各自重建
+        d["_bank"] = None                            # 550 KB，不必序列化 12 份
         return d
 
     def __call__(self, task: str, episode: int):
@@ -787,7 +846,27 @@ class OnlinePlanFactory:
         return OnlineVLMPlanner(
             task, d[0] if d else task.replace("_", " "), self.client,
             prior=prior, n_repeat=nrep,
-            phrasings=self.phrasings(task, var), views=self.views)
+            phrasings=self.phrasings(task, var), views=self.views,
+            fallback=self.fallback(task, episode))
+
+    def fallback(self, task: str, episode: int) -> list[dict] | None:
+        """API 断线时的兜底：该 (task, episode) 的模板计划。
+
+        取不到就返回 None（回到旧行为：抛 PlannerError）——兜底本身不该
+        成为新的失败源。
+        """
+        try:
+            return self.bank.get(task, episode)
+        except Exception:
+            return None
+
+    @property
+    def bank(self):
+        if self._bank is None:
+            from stage3.planners import plan_file
+            from stage3.online_planner import PlanBank
+            self._bank = PlanBank(plan_file(self.split, "template"))
+        return self._bank
 
     def phrasings(self, task: str, variation: int | None) -> list[str]:
         """该 (task, variation) 在 train cache 里出现过的全部子任务指令。
