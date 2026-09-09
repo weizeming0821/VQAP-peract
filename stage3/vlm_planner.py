@@ -340,6 +340,21 @@ def load_dwell_prior() -> dict:
     return out
 
 
+def _expand_dwell(task: str, seq: list[str]) -> list[str]:
+    """按训练统计把需要多帧的动作在先验里重复出来。
+
+    `[approach, grasp, transfer, wipe]` + transfer 中位 2 帧
+        -> `[approach, grasp, transfer, transfer, wipe]`
+    """
+    d = load_dwell_prior().get(task) or {}
+    if not d:
+        return list(seq)
+    out: list[str] = []
+    for a in seq:
+        out.extend([a] * max(1, int(d.get(a, 1))))
+    return out
+
+
 def gripper_class(action: str) -> str:
     """该动作下夹爪变化的含义；未知动作按 boundary 处理（保持旧行为）。"""
     return GRIPPER_SEMANTICS.get(action, "boundary")
@@ -374,7 +389,18 @@ ALLOW_EXTEND = os.environ.get("AAVLA_ALLOW_EXTEND", "1") != "0"
 #:    「正在做」和「做完了」看起来一样），VLM 只能猜，必然早推。
 #:  规则完全条件式：train 统计里中位 ≥2 的 (task, action) 只有 7 个组合，
 #:  其余全部为 1 —— 对它们规则永不触发，行为逐字不变。
+#: 表达方式 A：执行期拦截 NEXT（硬拦截）。
 MIN_DWELL = os.environ.get("AAVLA_MIN_DWELL", "1") != "0"
+#: 表达方式 B：**把先验本身修对** —— 训练统计说 transfer 要 2 帧，
+#: 就把先验里的 `transfer` 展开成 `transfer, transfer` 交给 VLM 去规划。
+#: 🔴 这才是问题的源头。实测 CSV 先验写的是
+#:      sweep: [approach, grasp, transfer, wipe]        transfer 只出现一次
+#:    而训练统计的关键帧数是 [1, 1, 2, 1] —— 先验把「transfer 要两帧」丢了，
+#:    VLM 忠实照着一个残缺先验规划（sweep 25/25 局逐字生成这 4 段）。
+#:  比硬拦截好在它是**软缓冲**：VLM 若在第 1 帧误判 NEXT，只是从 transfer#1
+#:  走到 transfer#2，指令几乎不变、无害吸收；而且两段措辞的细微差异还能把
+#:  PerAct 从不动点里拽出来（实测跨段目标点位移 0.130 m vs 同段 0.041 m）。
+EXPAND_DWELL = os.environ.get("AAVLA_EXPAND_DWELL", "1") != "0"
 
 
 class OnlineVLMPlanner:
@@ -618,7 +644,7 @@ class OnlineVLMPlanner:
         if d == "NEXT" and self.idx >= last:
             self.stats["next_at_last"] = self.stats.get("next_at_last", 0) + 1
             d = "EXTEND" if ALLOW_EXTEND else "CONTINUE"
-        if d == "NEXT" and MIN_DWELL and self._dwell:
+        if d == "NEXT" and MIN_DWELL and not EXPAND_DWELL and self._dwell:
             need = self._dwell.get(self.subtasks[self.idx]["action"], 1)
             if self.used < need:
                 # 该段的真实分段统计要求至少待 need 帧，而现在还没待够。
@@ -975,6 +1001,8 @@ class OnlinePlanFactory:
         prior = [(expand_prior(task, var, v) if var is not None else list(v))
                  for v in variants]
         nrep = n_repeat_prior(task, var) if var is not None else None
+        if EXPAND_DWELL:
+            prior = [_expand_dwell(task, p) for p in prior]
         return OnlineVLMPlanner(
             task, d[0] if d else task.replace("_", " "), self.client,
             prior=prior, n_repeat=nrep,
