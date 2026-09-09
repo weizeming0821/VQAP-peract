@@ -41,3 +41,14 @@ fi
 # ---- 其它 ----
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export PYTHONPATH="${VQAP_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+
+# ---- HuggingFace 离线模式 ----
+# 🔴 2026-09-09 两次事故：CLIP text tower（openai/clip-vit-base-patch16）
+#    每次评测都去 huggingface.co 校验，网络抖动时硬失败：
+#      "Failed to load CLIP text tower" -> 分片启动即死
+#    v3.5 跑丢 close_jar 整个任务；v3.6-test 12 个分片死了 6 个（150/300 局）。
+#    模型本地已缓存 1.2 GB（~/.cache/huggingface/hub/），根本不需要联网。
+#    离线模式让它直接用缓存，把这个故障源彻底去掉。
+#    ⚠️ 迁移到新机后需先确认缓存存在（run/env.sh 不做检查）。
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1

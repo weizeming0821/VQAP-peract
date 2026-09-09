@@ -1,4 +1,6 @@
+import glob
 import math
+import os
 from typing import Any, Dict, Sequence, Tuple
 
 import torch
@@ -861,6 +863,37 @@ class AdapterImageTokenizer(nn.Module):
 		text_tokens: [B, T_clip, hidden_dim]，T_clip 为 CLIP 文本塔的上下文长度（77）。
 		text_mask: [B, T_clip]，True 表示有效 token（SOT / 词 / EOT）。
 """
+def _resolve_clip_path(path: str) -> str:
+	"""把 hub id 解析成**本地快照目录**，避免每次加载都联网。
+
+	🔴 2026-09-09 两次事故：CLIP text tower 每次评测都去 huggingface.co
+	   校验，网络抖动时硬失败（"Failed to load CLIP text tower"），分片
+	   启动即死 —— v3.5 跑丢 close_jar 整个任务，v3.6-test 12 个分片死 6 个。
+	   模型本地早已缓存，纯粹是解析路径要联网。
+
+	注意不能靠 HF_HUB_OFFLINE + use_safetensors=True 解决：该组合仍会查
+	`/api/models/...` 而在离线模式下抛 OfflineModeIsEnabled。直接给快照
+	目录才彻底断开网络依赖。
+
+	找不到本地快照时原样返回，行为与改动前一致。
+	"""
+	if os.path.isdir(path):
+		return path
+	override = os.environ.get("AAVLA_CLIP_PATH", "")
+	if override and os.path.isdir(override):
+		return override
+	repo = "models--" + path.replace("/", "--")
+	root = os.environ.get("HF_HOME") or os.path.expanduser("~/.cache/huggingface")
+	pat = os.path.join(root, "hub", repo, "snapshots", "*", "model.safetensors")
+	for hit in sorted(glob.glob(pat)):
+		snap = os.path.dirname(hit)
+		# 必须是完整快照：光有权重没有 config/tokenizer 是没法用的
+		if os.path.isfile(os.path.join(snap, "config.json")) and \
+		   os.path.isfile(os.path.join(snap, "vocab.json")):
+			return snap
+	return path
+
+
 class AdapterTextTokenizer(nn.Module):
 
 	def __init__(
@@ -879,7 +912,7 @@ class AdapterTextTokenizer(nn.Module):
 
 		self.hidden_dim = int(hidden_dim)
 		self.feature_dim = int(clip_cfg["feature_dim"])
-		self.pretrained_path = str(clip_cfg["pretrained_path"])
+		self.pretrained_path = _resolve_clip_path(str(clip_cfg["pretrained_path"]))
 		self.freeze = bool(freeze)
 
 		try:

@@ -64,6 +64,8 @@ class LiveAdapter:
         self._verbose = verbose
         self._m = None
         self.n_calls = 0
+        self.last_conf = None          # 最近一次 k_global 的 softmax 最大值
+        self.last_conf_detail = None   # 9 个 detail 头的平均最大概率
 
     # ------------------------------------------------------------------
     @property
@@ -106,8 +108,15 @@ class LiveAdapter:
             imgs[cam] = _as_uint8_chw(a).unsqueeze(0).to(self._dev)
         with torch.no_grad():
             out = m(imgs, [instruction])
-        g = int(out["global_logits"].argmax(-1).reshape(-1)[0])
+        gl = out["global_logits"].reshape(-1)
+        g = int(gl.argmax(-1))
         d = [int(x) for x in out["detail_logits"].argmax(-1).reshape(-1).tolist()]
+        # 🔴 置信度：原来只取 argmax、把分布丢了。码本没见过这个场景时
+        #    Adapter 本该「没把握」—— 这是比「任务名白名单」更有原则的
+        #    门控依据（不需要测试时知道任务身份）。先采集、暂不据此门控。
+        self.last_conf = float(torch.softmax(gl.float(), -1).max())
+        dl = out["detail_logits"].reshape(9, -1)
+        self.last_conf_detail = float(torch.softmax(dl.float(), -1).max(-1).values.mean())
         # 与离线 cmd_codes 同款硬校验（A4）：越界宁可炸，也不要静默喂个坏索引，
         # 因为 CodebookLookup 的 IndexError 会在更深的地方冒出来，不好定位。
         if not 0 <= g < 36:
