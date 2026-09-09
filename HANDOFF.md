@@ -1,425 +1,370 @@
-# AA VLA 项目交接（2026-09-07）
+# AA VLA 项目交接（2026-09-09 晚）
 
-> **接手会话请先读完这份,再动手。** 顺序建议：
-> 1. 第二节「当前状态」—— 知道已经测出了什么
-> 2. 第三节「核心发现」—— 知道为什么现在要改注入层
-> 3. 第四节「踩过的坑」—— 每一条都是真实事故,不读会重蹈
-> 4. 第七节「下一步」—— 知道现在该干什么
+> **接手会话请先读完这份再动手。** 建议顺序：
+> 1. 第一节「一句话现状」—— 知道现在处在什么局面
+> 2. 第二节「test 主表」—— 唯一能写进论文的数字
+> 3. 第三节「五条已证伪 / 已证实的结论」—— 不读会重复做已经做过的死路
+> 4. 第六节「踩过的坑」—— 每条都是真实事故
+> 5. 第七节「下一步」
 >
-> 预检：`python tools/preflight_stage3.py`（覆盖环境/数据/cache/权重/配置/代码不变式/单测/replay）
+> 预检：`python tools/preflight_stage3.py`
+> 入口：`cd /data0/xiexiao/VQAP && source run/env.sh`
 
 ---
 
-## 一、这个项目在做什么
+## 一、一句话现状
 
-验证一个假设：**把「原子动作码本」注入 VLA,能否提升机器人操作的成功率与组合泛化。**
+**test split 已全部跑完。核心主张 `B4 > B2` 在 test 上不成立（−1.67 pp），
+而 `B4 < B1` 达到显著（−7.00 pp, p=0.044）。**
 
-方法叫 VQAP,baseline 是 PerAct（CoRL 2022,RLBench）。链路：
+也就是说：加码本的臂（B4）在 held-out 测试集上**显著差于**只用整任务指令微调的
+baseline（B1），也没有超过无码的子任务指令臂（B2）。val 上曾观察到的
+`B4 − B2 = +4.67 pp` **没有复现**。
 
-```
-Stage 0/1  码本预训练  → 双码本 Kg=36 / Kd=192, d_code=512          ✅ 完成,冻结
-Stage 2    Adapter：(front+wrist 观测, 子任务指令) → 码索引          ✅ 完成,冻结
-           checkpoints/vqap_adapter/best.pth  val global_top1 89.69%
-Planner    把任务拆成原子动作子任务                                  ✅ 离线 cache 已建
-Stage 3    把码注入 PerAct,训练四臂并评测                            ⬅️ 当前阶段
-```
-
-### 四臂设计
-
-```
-B0 ──(+微调)──> B1 ──(+子任务指令)──> B2 ──(+码注入)──> B3
-                                    B4 = B3 但换成 v2 注入层（新增,见第六节）
-```
-
-| 差值 | 归因 |
-|---|---|
-| B0 本身 | 验证评测管线正确性（E0,所有结论的前提门禁） |
-| B1 − B0 | 微调本身的效果 |
-| B2 − B1 | Planner 的功劳,**不计入 VQAP 贡献** |
-| **B3 − B2** | **码本的功劳 —— 全文核心主张** |
-
-**没有 B2 就无法区分「增益来自码本」还是「来自任务被拆短」。B2 目前仍未训练。**
+这不是需要继续调 planner 就能解决的问题 —— 见第三节的证伪链。
 
 ---
 
-## 二、当前状态
+## 二、test 主表（Seen12 · test split · 25 局/任务 = 300 局）
 
-### 2.1 实测结果（**全部是 val,test 一次都没跑**）
+**全部为 held-out 结果，每格都是完整 300 局，无残缺无回落。**
 
-> 口径：Seen12 · **val** split · 每任务 25 局 = 300 局 · `template + plan codes`。
-> 评测非确定性（RRT 随机）,12 任务均值单次 σ ≈ 1.5 pp,差值 σ ≈ 2.1 pp。
-> **相差 3 pp 以内不应认为有差异。**
-
-| 任务 | B0 | B1@10000（峰值） | B1@40000 | B3@20000 | B3@40000 |
+| 任务 | B0<br>零训练 | B1<br>整任务+微调 | B2<br>子任务指令 | B4<br>v2码注入 | B4·X3 v3.6<br>在线planner |
 |---|---:|---:|---:|---:|---:|
-| close_jar | 32 | 48 | 56 | 32 | 40 |
-| light_bulb_in | 8 | 12 | 8 | 20 | 20 |
-| open_drawer | 72 | 72 | 76 | 80 | 84 |
-| place_cups | 0 | 4 | 0 | 0 | 0 |
-| place_shape_in_shape_sorter | 8 | 12 | 12 | 8 | 0 |
-| place_wine_at_rack_location | 32 | 44 | 40 | 36 | 40 |
-| push_buttons | 24 | 28 | 16 | 20 | 20 |
-| put_groceries_in_cupboard | 4 | 8 | 8 | 0 | 0 |
-| reach_and_drag | 84 | 96 | 72 | 72 | 80 |
-| slide_block_to_color_target | 64 | 96 | 56 | 44 | 64 |
-| stack_blocks | 8 | 28 | 20 | 16 | 16 |
-| sweep_to_dustpan_of_size | 44 | 76 | 60 | 36 | 60 |
-| **均值** | **31.67** | **43.67** | **35.33** | **30.33** | **35.33** |
+| close_jar | 44 | 44 | 28 | 36 | 32 |
+| light_bulb_in | 4 | 16 | 12 | 16 | 28 |
+| open_drawer | 92 | 76 | 84 | 88 | 72 |
+| place_cups | 0 | 0 | 0 | 0 | 0 |
+| place_shape_in_shape_sorter | 0 | 8 | 12 | 8 | 20 |
+| place_wine_at_rack_location | 44 | 48 | 20 | 16 | 20 |
+| push_buttons | 28 | 32 | 24 | 12 | 32 |
+| put_groceries_in_cupboard | 20 | 16 | 12 | 0 | 8 |
+| reach_and_drag | 92 | 60 | 88 | 88 | 56 |
+| slide_block_to_color_target | 64 | 56 | 56 | 48 | 24 |
+| stack_blocks | 4 | 40 | 16 | 24 | 12 |
+| sweep_to_dustpan_of_size | 64 | 76 | 56 | 52 | 48 |
+| **均值** | **38.00** | **39.33** | **34.00** | **32.33** | **29.33** |
 
-**B1 完整 val 曲线（300 局/点）**
-```
-step:   0     2500   5000   7500  10000  12500  15000  17500  20000  ...  40000
-      29.7   39.7   39.0   42.0   43.7   39.7   39.7   40.7   34.3       35.33
-                             └峰值┘                            └谷底┘
-```
-10000 步后进入下行,20000 步跌到 34.3（较峰值 −9.4 pp,>3σ,真实退化）。
+### 配对检验（McNemar，同 episode 索引 ⇒ 同物体摆放）
 
-**B3 完整 val 曲线（300 局/点）**
+| 对比 | Δ | 翻转局 | p | 判定 |
+|---|---:|---:|---:|---|
+| B0 → B1（微调的价值） | +1.33 | 84 | 0.744 | ❌ 无差别 |
+| B2 → B1（子任务指令的代价） | +5.33 | 112 | 0.156 | ❌ 不显著（方向符合预期） |
+| **B2 → B4（核心主张）** | **−1.67** | 63 | 0.615 | ❌ **不成立** |
+| **B1 → B4** | **−7.00** | 99 | **0.044** | ✅ **显著变差** |
+
+> 🔴 **口径纪律**：所有臂都必须用同一口径（mean 或 max，不能混）。
+> 用户已定：**报 mean 和 max，以 mean 为分析依据**。
+> `max-of-3` 相对真值系统性偏高约 +1.3 pp，与要论证的效应量同量级。
+
+---
+
+## 三、五条已经钉死的结论（**不要重复验证**）
+
+### 3.1 评测噪声地板（这是读所有数字的前提）
+
+同权重、同代码重跑 4 次（只有 RRT 随机性）：
+
 ```
-step: 20000  40000  60000  80000  100000
-      30.33  35.33  36.00  35.00  35.00
-             └────── 完全饱和,再训无增益 ──────┘
+整体 300 局：单次测量 SD 1.49 pp，两次之差 SD 2.11 pp
+单任务 25 局：中位 |Δ| 4.0 pp，|Δ|≥8pp 占 44%，≥12pp 占 12%，≥16pp 占 2%
 ```
 
-### 2.2 各臂状态
+**逐任务 ±12 pp 以内的涨跌一律不可解读。** 之前大量"某任务涨了/跌了"的分析
+都是在读噪声。要判断一个改动是否真的有效，必须做**配对 McNemar**，
+而不是比较均值。
 
-| 臂 | 训练 | 评测 | 备注 |
+### 3.2 🔴 子任务指令的语言内容对 PerAct 无影响（`flat` 对照）
+
+`flat` = 把子任务指令**全部换成整任务指令**，码与分段完全不变：
+
+```
+B4 模板法（子任务指令）  33.67%  [min 32.33 / max 35.00]   val
+B4 flat（整任务指令）    34.33%                            val
+                        Δ = −0.67 / +2.00 pp   p = 0.906 / 0.545   ❌ 无差别
+```
+
+**PerAct 根本没在用子任务指令里的信息。** 这直接封死了整条 X3 路线 ——
+三层措辞协议、指令模板库、变体先验、夹爪语义、末段续写、先验展开，
+**优化的都是一个不影响输出的输入**。
+
+这解释了为什么 X3 六个版本、四轮机制改动，每次机制都精确生效、成绩却纹丝不动。
+
+### 3.3 码注入本身是健康的，但可能在加噪
+
+```
+tools/b4_health.py --arm B4 --step 40000
+  注入幅度 4.78%（判据 ≥3% OK）    参照：v2 初始 16.79%，v1 训练 100k 后 0.0095%
+  B4 训练 loss 2.90  vs  无码基线 B2 loss 2.46      ← B4 拟合训练目标反而更差
+```
+
+码确实到达了模型（不是 v1 那种被 LAMB 锁死的退化），但**带码的 loss 更高**。
+配合 3.4 的门控实验，一致解释是：**注入的码对相当一部分样本是噪声**。
+
+### 3.4 码本覆盖门控能涨点（但只到与 B1 持平）
+
+18 个任务里 5 个不在 `AtomAction_Dataset`（Seen12 val 中占 4 个：
+`place_cups` / `place_wine_at_rack_location` / `slide_block_to_color_target` /
+`sweep_to_dustpan_of_size`）。对它们把 `subtask_code_mask` 置 0：
+
+```
+                  全部12    覆盖8    未覆盖4
+B1 基线            35.33    33.50    39.00
+B4 原版            33.67    36.50    28.00
+B4 门控            36.00    35.50    37.00      ← 未覆盖组 +9.00 pp
+```
+
+> ⚠️ **一个必须避免的误读**：门控**不改动**覆盖 8 任务，所以那三次的覆盖 8 分数
+> （39.50 / 33.50 / 33.50）是**同一个量的三次独立测量**，极差 6.0 pp。
+> 我曾把第三次抽样误读成"门控导致覆盖组下跌 3 pp"，这是错的。
+
+开关：`AAVLA_CODE_GATE_OFF="任务1,任务2,..."`（默认关）。
+**用户明确：只作分析用，不进最终架构。**
+
+### 3.5 🔴 Adapter 置信度**不能**用来判断码本覆盖
+
+采集 1673 次带置信度的码调用（免费，`--planner template --codes adapter`）：
+
+```
+              n     中位     p25    p50    p75
+覆盖 8      1156   0.907    0.581  0.908  0.943
+未覆盖 4     517   0.678    0.332  0.678  0.924
+
+最佳阈值 τ=0.20 的二分准确率 71.5%，随机基线 69.1%  →  只比瞎猜好 2.4 pp
+```
+
+逐任务更清楚：`sweep`（未覆盖）0.907、`slide_block`（未覆盖）0.823 —— 和覆盖任务
+一样高；而 `light_bulb`（覆盖）0.604、`put_groceries`（覆盖）0.703 反而低。
+
+**Adapter 在没见过的场景上是"自信地错"，它不知道自己不知道。**
+所以置信度门控不能替代任务白名单。这条路已排除。
+
+---
+
+## 四、X3 在线 planner 的完整历史（**建议就地定版，不要再迭代**）
+
+### 版本序列与实测
+
+```
+B3@40000 · val · 10 局/任务（120 局）
+  v3.0  26.67    v3.1  29.17    v3.2a  26.67    v3.2c  33.33    v3.3  34.17
+
+B4@40000 · val · 25 局/任务（300 局）· 同 11 任务口径（X1 同口径 32.36）
+  v3.3  27.64    v3.4  27.64    v3.5  29.45
+
+B4@40000 · test · 25 局/任务（300 局）
+  v3.6  29.33     （split 难度校正后 ≈ 26.17，见下）
+```
+
+> 🔴 **v3.3 在 B3、v3.4/3.5 在 B4，两段序列不能连读。**
+> v3.6 在 test、其余在 val，跨 split 比较必须校正
+> （校正量 = [(B0test−B0val)+(B1test−B1val)]/2，逐任务从 −8 到 +16，波动很大）。
+
+### 各版本改了什么、验证结果如何
+
+| 版本 | 改动 | 机制验证 | 成绩 |
 |---|---|---|---|
-| **B0** | 零训练（官方 `peract_600k`） | ✅ val 31.67% | test 未跑 |
-| **B1** | ✅ 40000 步 | ✅ val 0–20000 + 40000 | test 未跑；22500–37500 **不需要评**（用户已确认） |
-| **B2** | ❌ 只到 step 400 被机器卡死 | ❌ | **需重跑**,约 10 h |
-| **B3** | ✅ 100000 步（41 个 ckpt） | ✅ val 五点 | test 未跑 |
-| **B4** | ❌ 代码就绪,未训 | ❌ | v2 注入层已实现 + 单测通过 |
+| v3.2c | 关掉执行记忆 | REPLAN 173 → 6 | +6.66（唯一有机制支撑的一次） |
+| v3.3 | 夹爪语义分类（按动作分 boundary/tool/hold） | 压制 186 次误触发 ✅ | 无差别 |
+| v3.4 | RETRY 位置回退 | 触发 157/300 局，移动中位 0.446 m ✅ | **Δ=+0.00, p=1.000** |
+| v3.5 | 末段禁用 NEXT + EXTEND 续写 | 末段空转 500 → **0** ✅ | +1.82（噪声内） |
+| v3.6 | 先验展开（transfer → transfer,transfer） | 段数 4 → 5 ✅ | 未修好目标任务 |
 
-### 2.3 test 的状态
+**每一次机制都精确生效，成绩都没动** —— 与 3.2 的 `flat` 结论完全一致。
 
-```
-❌ 任何臂、任何 ckpt 都没有跑过 test split
-✅ test 的子任务计划已生成 aavla_data/planner_cache/plans_test_template.json
-   （300 条,variation 精确命中 292、回退 8、缺失 0）
-```
+### v3.6 的一个未诊断回归
 
-> ⚠️ 文献里 PerAct 论文报告的 ~43.7% 是**他们的 test split**,与我们的 val 不可直接比。
-> 我们的 B0 在自己的 val 上是 31.67%,系统性低约 12 pp,但逐任务排序一致 → 判定为
-> 数据差异而非管线错误（E0 门禁通过）。
+`open_drawer` 在此前所有版本都是 88–96，v3.6 掉到 66（校正后），远超噪声上限。
+但 `open_drawer` 的先验是 `[approach, grasp, pull]`，训练统计全是 1 帧，
+**先验展开对它不该有任何作用**。可能来自 `grasp` 段被展开（`close_jar` 的 grasp
+中位是 2），或 EXTEND 在 test 上触发方式不同。**未诊断，轨迹都在，可免费查。**
 
-### 2.4 评测方案对比（B3@40000 · val）
+### 环境变量（全部可逐字回退）
 
-| 方案 | 局数 | 均值 | 说明 |
-|---|---:|---:|---|
-| **X1 `template + plan`** | 300 | **35.33%** | ← 当前最好,零成本,与全部历史数据同口径 |
-| X2 `template + adapter` | 300 | 34.33% | 实时 Adapter 出码,−1.00 pp（噪声内） |
-| X3-v1 `vlm-plan + adapter` | 120 | 26.67% | |
-| X3-v2 `vlm-plan + adapter` | 300 | 22.33% | 推进更快版,反而更差 |
-| X3-v3.1 | — | **未测成** | 三次启动都被机器负载挡住 |
-
-**结论：test 用 X1。** 在线 planner 三版都输给模板法。
-
----
-
-## 三、核心发现：码本贡献为零（三条独立证据）
-
-| 证据 | 观测 |
-|---|---|
-| **权重侧** | `code_injector.gate` 范数 100000 步只从 0.0036 长到 0.0061（1.7×）,注入对 latents 的改变量 **0.0095%** |
-| **行为侧** | 把码来源从「模板库查表」换成「实时 Adapter 看当前画面预测」,35.33% → 34.33%（**−1.00 pp,噪声内**） |
-| **端到端** | `B1@40000 = B3@40000 = 35.33%`；两臂逐任务相关系数 **r=+0.961**,失败模式高度一致 |
-
-> ⚠️ 措辞纠正：均值相同是**巧合**,不是「同一个模型」。逐任务差的绝对值均值 6.67 pp,
-> 范围 [−16, +12],恰好抵消。但每任务 25 局的差值 SE ≈ 13.5 pp,所有差都在 1.2σ 内 ——
-> 数据完全兼容于「两臂表现相同」。要分辨这些差异需要每任务约 100 局。
-
-### 四条已量化的根因
-
-```
-① 全局码与语言高度冗余     H(k_global)=3.941 bit
-                          H(k_global | 子任务指令)=0.910 bit    → 指令已解释 77%
-② 细节码 82.8% 退化        9 槽位完全相同的段 5652/6824
-③ 门控被 LAMB 锁死         ‖Δp‖ ≡ lr·‖p‖（见第四节第 1 条）
-④ FiLM 的 β 被抵消         SpatialSoftmax3D 对空间常数偏置不变
-```
-
-**③ 是本阶段要修的（B4）。① 是天花板 —— 即使门全开,增量信息也不到 1 bit。**
-
----
-
-## 四、🔴 踩过的坑（每一条都是真实事故）
-
-### 1. LAMB 的信任比会锁死零初始化张量 —— 本项目最大的一个坑
-
-`source/peract/helpers/optim/lamb.py:105-122`：
-
-```python
-trust_ratio = ‖p‖ / ‖adam_step‖
-p -= lr · trust_ratio · adam_step
-⇒ ‖Δp‖ ≡ lr · ‖p‖          # 步长正比于参数自身范数！
-```
-
-零初始化张量只有第一步自由（`‖p‖=0` → `trust_ratio=1`）,之后被锁进每步至多长 `lr` 的
-倍增。`gate`（128 维）第一步只走 `lr·3.162·√128 = 3.6e-3`,之后 100000 步只长到 6.1e-3。
-
-**判据：任何零初始化的可训张量在 LAMB 下都要警惕。** B4 的 v2 注入层用小随机初始化
-（`w_g` std=0.01、`w_o` std=0.02）绕开了这个问题。
-
-### 2. `xvfb-run -a` 会撞号,能打死别的进程
-
-两步（扫空号 → 起 Xvfb）之间没有锁。并发分片会挑中同一个号,先退出的在 trap 里
-kill 自己的 Xvfb 并删 lock,**把另一个分片的 X server 一起带走**（`XIO: fatal IO error`）。
-**曾因此打死一次训练。**
-
-已修：`scripts/stage3_eval.py:pick_displays()` 父进程一次性分配互不相交的号,用
-`xvfb-run -n <num>`。并发跑多个评测时**必须用 `--display-base` 错开号段**（130/160/190）。
-
-### 3. DDP master port 写死,第二个训练起不来
-
-`conf/stage3.yaml` 的 `master_port: 29500`。第二个作业报 `EADDRINUSE`,而且错误埋在
-`mp.spawn` 子进程里,父进程只吐一大段 `ProcessRaisedException` —— **白等了 35 分钟才发现**。
-
-已修：`train.py:_free_port()` 在 spawn 前探测,被占自动换并告警。
-
-### 4. 合并结果会「塌列」和「静默残缺」
-
-- **塌列**：12 分片各跑 1 任务时 YARR 走**单任务** env 分支,列名不带任务后缀
-  （`_independent_env_runner.py:272`）,12 份 CSV 列名全一样,外连接塌成一列。
-- **静默残缺**：列是按分片任务名补的,**分片没产出数据时列照样存在**,只是值为空 ——
-  实测 `put_groceries_in_cupboard` 整列缺失,而退出码 0、列数 12、均值却是拿 11 个任务算的。
-
-已修：`_merge_shards` 补任务后缀 + **逐任务查值**；残缺时 run 以非零码退出。
-
-### 5. `eval_data.csv` 会被不同配置互相覆盖
-
-它是单一数据流、按 step 存行。不同 planner/codes 跑同一 step 会互相覆盖 ——
-实测 CSV 里 step 2500 的 13.33 其实是 vlm 那轮的,把 template 的 15.83 覆盖了。
-
-已修：每轮跑完立刻归档带完整配置标签的 JSON 到 `result/p7/`。**读结果一律读这些 JSON,
-不要读 `eval_data.csv`。**
-
-### 6. 分片日志会被下一轮截断
-
-原来固定叫 `B3.eval.sh6.out`,下一轮开跑就 truncate,**想回查分片失败原因时现场已经没了**。
-已修：日志名带 ckpt/planner/codes。
-
-### 7. `pkill -f` / `os.kill` 循环会杀掉自己
-
-`pkill -f "xxx"` 会匹配到**自己这条 bash 命令行**（命令文本里含该字符串）。
-**已自杀三次。** 正确做法：按 argv 精确匹配 + 要求 `argv[0]` 是 python,并抽成独立脚本
-文件（不内联,否则脚本文本本身又会被匹配到）。见
-`/tmp/.../scratchpad/kill_watch.py` 的写法。
-
-### 8. `ps -o user=` 会把用户名截断到 8 字符
-
-`weizeming` → `weizemin`,拿它和 `$USER` 比**永远不相等**。
-已修：`tools/gpu_reserver.py` 改用 `os.getuid()` 比较。
-
-### 9. DDP 真正占卡的是 `mp.spawn` 子进程
-
-它们的 cmdline 是 `python -c from multiprocessing.spawn import spawn_main; ...`,
-**不含 "train.py"**。按关键词匹配判归属必然漏判。已修：只按 uid 判。
-
-### 10. 闭包 pickle 不了（踩过两次）
-
-`eval.py:215` 用 spawn 起子进程,`Stage3RolloutGenerator`（连同它持有的工厂）会被
-pickle；`replay_dataset._seal` 那次是 DataLoader 的 spawn worker。
-**凡是要跨进程的可调用对象,一律模块级类。**
-
-### 11. 共享机器会被打穿,DataLoader 饿死会让 DDP 静默卡死
-
-实测 load average 226、sda 读队列深度 251 时：B2 的 `Sample time` 从 0.0004 跳到 0.145,
-随后两个 rank 都停在 `futex_wait_queue`,75 秒 CPU 时间只涨 1 秒 —— **完全卡死,不报错**。
-
-**开训前必看：load average < 40、sda 队列深度 < 20。** 否则大概率重演。
-卡死后父进程的 SIGTERM 带不走子进程,要按 PID 逐个 SIGTERM + SIGKILL。
-
-### 12. 模板法的推进规则曾有一个致命 bug
-
-`MIN_BUDGET = 2` 让每个单关键帧段被强行占住两帧,误差逐段累积。离线比对：
-**逐关键帧分段一致率只有 20.9%,79% 的帧落后真值 1–2 段**。B3@2500 因此只有 10.0%。
-修成 `MIN_BUDGET=1` + 累计边界后升到 92.5%,成绩 10.0% → 15.8%。
-
-**`tools/test_online_planner.py` 第 10 组是这条的回归防线（一致率 ≥85%）。**
-
-### 13. 其它
-
-- 训练**不需要** X（voxel summary 已改为 `PERACT_VOXEL_SUMMARY=1` 才开,默认关）；评测需要。
-- 评测的 tensorboard 默认关（`YARR_EVAL_TENSORBOARD=1` 才开）—— 曾产生 19 GB tfevents 把盘写满。
-- 长任务一律 `setsid`,否则会话重启会连坐杀掉。
-- 高负载时 `setsid nohup ... &` 可能根本没执行到（日志文件时间戳不变即是证据）,
-  启动后**必须验证日志被 truncate 了**。
-
----
-
-## 五、代码地图
-
-### 本阶段新增/大改的文件（都还没 commit）
-
-| 文件 | 作用 |
-|---|---|
-| `scripts/stage3_eval.py` | **评测唯一入口**。子命令 `setup-b0/bench/run/plans/prune/report/trace`。分片、分卡预检、display 分配、结果自归档、硬校验 |
-| `stage3/planners.py` | planner 的**唯一选择点**。`template / flat / oracle / vlm / vlm-plan` |
-| `stage3/online_planner.py` | 模板库 + 计划预生成 + `DeterministicPlanner`（累计边界推进） |
-| `stage3/vlm_planner.py` | 在线 VLM planner：`VLMPlanner`（选下标）+ `OnlineVLMPlanner`（现场规划,v3.1） |
-| `stage3/adapter_codes.py` | `LiveAdapter` —— 评测时实时调 Stage 2 Adapter 出码 |
-| `stage3/rollout.py` | `Stage3RolloutGenerator` + `_SubtaskAgent`,轨迹落盘 |
-| `stage3/replay_dataset.py` | replay 作为**不可变工件**：路径解析、6 道校验、密封 |
-| `model/code_injector.py` | `CodeInjector`（v1）+ **`CodeInjectorV2`（v2,B4 用）** |
-| `tools/test_online_planner.py` | 51 条断言,含分段一致率回归 |
-| `tools/test_vlm_plan.py` | vlm-plan 的触发规则/四态决策/护栏 |
-| `tools/test_injector_v2.py` | **18 条断言,重点验注入幅度 ≥5%** |
-| `tools/test_adapter_codes.py` | 实时 Adapter 与离线 cache 逐位复现（35/35） |
-| `tools/gpu_reserver.py` | 显卡看门：`watch/status/release/hold/unhold`,盘子上限 4 |
-
-### 结果与日志的位置
-
-```
-result/p7/*.json          ← 🔴 唯一权威的结果来源（带完整配置标签）
-result/p6_<planner>/traces/<arm>_<split>_<ckpt>/   逐局 planner 轨迹
-checkpoints/stage3_main/<arm>/seed0/weights/<step>/
-log/p5/                   训练与评测日志
-Exp_Design.md 第七节       结果汇总表
+```bash
+AAVLA_PHRASING_MODE=select    # 三层指令协议；free = v3.1 自由生成
+AAVLA_PLANNER_HISTORY=0       # 执行记忆，默认关（开 = v3.2a，实测最差）
+AAVLA_PRIOR_VARIANTS=1        # 备选先验
+AAVLA_GRIPPER_SEMANTICS=1     # v3.3 夹爪语义
+AAVLA_RETRY_ROLLBACK=0        # v3.4 位置回退，默认关（实测效果为零）
+AAVLA_ALLOW_EXTEND=1          # v3.5 末段续写
+AAVLA_MAX_EXTEND=2  AAVLA_MAX_SEGMENTS=10
+AAVLA_EXPAND_DWELL=1          # v3.6 先验展开（与 MIN_DWELL 互斥）
+AAVLA_MIN_DWELL=1             # v3.6 硬拦截版本（EXPAND_DWELL 开时自动失效）
+AAVLA_CODE_GATE_OFF=""        # 码本覆盖门控，默认关
 ```
 
 ---
 
-## 六、B4 的 v2 注入层（已实现,未训练）
+## 五、数据与代码地图
 
-### 设计
-
-```python
-h   = latents + M(z_g) * mask          # 全局码：ln → mlp(256) → w_g(std=0.01),逐通道相加
-out = h + cross_attn(h, Z_d) * mask    # 细节码：cross-attn 残差,**无门控**
-```
-
-**没有 gate、没有 FiLM,两个投影都是正常尺度初始化** —— 第四节第 1 条那个坑从源头消失。
-
-### 单测实测的注入幅度
+### 结果归档（**逐局分数是唯一可做配对分析的东西，务必保留**）
 
 ```
-v1 初始注入   0.0000%      （训 100000 步后也只有 0.0095%）
-v2 初始注入  16.79%
-   全局码支路   6.33%
-   细节码支路  15.47%
-   换全局码 → 输出改变  7.16%
-   换细节码 → 输出改变 21.09%
+result/p7/versions/
+  _perep/              全部历史运行的逐局分数（B0/B1/B2/B3/B4 各 ckpt）
+  rep2/                B4@20000/40000/60000 与 B1@40000 的第二次测量（噪声标定用）
+  B0_test/  B1_test/  B2_template_test/  B4_template_test/     ← test 主表
+  B4_x3_v33/  B4_x3_v34_rollback/  B4_x3_v35/  B4_x3_v36_test/  ← X3 各版本
+  B4_gated/            码本门控实验
+  B4_flat/             flat 对照（子任务指令 → 整任务指令）
+  B4_conf/             Adapter 置信度采集（1673 次调用）
+  v3.3/                v3.3-on-B3 的完整轨迹
+  _failed_*/           失败运行的存档（API 断线 / CLIP 离线 / 空计划）
 ```
 
-### 已确认的设计决定（用户拍板）
+每个目录含 `per_episode.json`（`{"task|episode": {"score", "goal"}}`）、
+分片日志、以及 `traces/`（planner 逐帧轨迹）。
+
+> 🔴 **分片日志和 traces 会被下一轮运行覆盖。** 跑完立刻归档，否则无法做配对分析。
+> 曾因此丢掉 v3.2c 的全部逐局数据，导致无法归因。
+
+### 本阶段改动的文件（全部已 commit 并推送）
 
 ```
-w_g std = 0.01          全局码初始注入约 16%
-w_o std = 0.02          保持不变（v1 原值）
-hidden  = 256           保持不变
-warmup  不加            保留现有训练框架
-细节码  保留 cross-attn,残差相加 out = h + o
+stage3/vlm_planner.py      X3 v3.3–v3.6 全部机制 + 断线韧性 + 停留先验
+stage3/rollout.py          v3.4 位置回退 + gap 仪表 + 码本门控开关
+stage3/adapter_codes.py    Adapter 置信度记录（softmax max）
+planner/prompts.py         EXTEND 决策 + 末段 LAST-STEP NOTE
+model/module/encoder.py    CLIP 本地快照解析（断网依赖）
+run/env.sh                 HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE
+
+tools/test_rollback_v34.py       19 项
+tools/test_planner_resilience.py 15 项
+tools/test_vlm_plan_v35.py       24 项
+tools/test_vlm_plan_v36.py       17 项
 ```
 
-### 关于 `code_mask=0`
+相关提交：`22f172e`(v3.3) `28da219`(v3.4) `089548b`(断线韧性) `99f24e1`(v3.5)
+`20bd6eb`(空计划) `757e0cd`(v3.6-A) `e6d18ca`(v3.6-B) `9bd1155`(CLIP离线+置信度)
 
-**只在 `action == pose-adjust` 时发生,实测 112/10323 = 1.08%。**
-所以「mask=0 时逐位等价」**不是安全网**（98.9% 的样本走 mask=1）,
-它的价值是**单测锚点** —— 抓「乘/加写反」这类实现 bug。
+---
 
-### 如何启用
+## 六、🔴 踩过的坑（本轮新增，旧坑见 git 历史中的上一版 HANDOFF）
 
-```yaml
-# conf/stage3.yaml
-stage3:
-  injector: v1     # v1=B3 那版（默认）；v2=B4
+### 1. CLIP 每次评测都联网校验 —— 打死过两次运行
+
+```
+Error: Failed to load CLIP text tower from: openai/clip-vit-base-patch16
+Error: HTTPSConnectionPool(host='huggingface.co', port=443)
 ```
 
-`launch_utils.py` 按此选类。**v1 保留是为了 B3 的既有 checkpoint 仍能加载**（两版参数名
-不同,混用会报错而不是静默加载错）。
+v3.5 丢了整个 `close_jar`（275/300 局）；v3.6-test 12 个分片死 6 个（150/300 局）。
+模型本地早已缓存 1.2 GB，纯粹是解析路径要联网。
 
-### ⚠️ B4 还缺一步：臂定义
+**不能只靠 `HF_HUB_OFFLINE` + `use_safetensors=True`** —— 该组合仍会查
+`/api/models/...` 并在离线模式抛 `OfflineModeIsEnabled`；回退到默认解析又会命中
+`pytorch_model.bin`，被 transformers 的 CVE-2025-32434 检查拒绝（torch<2.6）。
+**只有直接给本地快照目录才彻底断网**（`model/module/encoder.py::_resolve_clip_path`）。
 
-`stage3/arms.py` 目前只有 B0–B3。B4 需要**独立的 checkpoint 目录**,不能覆盖 B3 的 41 个 ckpt。
-两个办法：
+### 2. VLM API 断线会杀掉整个分片
 
-- **(a) 新增 `B4` 臂**（= B3 的字段权限 + `injector=v2`）—— 约 15 行,**推荐**。
-  归档文件名、`stage3_eval.py --arm`、结果表都靠臂名区分,混用一定出乱子。
-- (b) 只改 `framework.logdir` 指到别处,`arm` 仍写 B3 —— 省事但结果目录会出现
-  「arm=B3 却是 v2」的歧义。
+一次 `APIConnectionError` → `PlannerError` → YARR 把异常继续上抛 → **整个分片死掉**，
+该任务剩余的局全丢。12 个分片分别在第 7~24 局被打死，300 局只跑出 126 局。
 
-**这一步尚未做,接手时先定。**
+已改成**退化 + 留痕**（`P12`）：PLAN 失败回落模板计划并记
+`plan_source="template_fallback"`；MONITOR 失败退化成 CONTINUE；连续失败 2 次判定
+断线、本局停止调用（否则每次走满 4 重试 × 指数退避 ≈ 30 s，把速度拖到 25.8 s/局）。
+
+**分析时必须先剔除 `plan_source == "template_fallback"` 的局。**
+v3.6-test 第二次跑有 180/300 局回落，整体数字完全不可用。
+
+### 3. EXTEND 把 `_plan` 引入局中路径，空计划会杀分片
+
+v3.5 首跑 300 局只出 119 局，9 个分片死于 `PlannerError: vlm-plan 生成了空计划`。
+EXTEND 会在局中问 VLM"还剩什么要做"，而 VLM 完全可能答"没有了" —— 这是合法回答。
+那句 `raise` 落在断线兜底的 `try` 之外。已修（`20bd6eb`）。
+
+### 4. 同一臂的两个评测并发会互撞 `eval_data.csv`
+
+路径是 `checkpoints/stage3_main/<arm>/seed0/eval_data.csv`，只按臂名分。
+**同臂并发必然互相覆盖**；不同臂并发是安全的（B0/B1 test 就是这么并行的）。
+
+### 5. `--shards` 上限就是任务数
+
+`n = min(a.shards, len(tasks))`。12 个任务时给再多 GPU 也只有 12 个分片，
+**加卡不会更快**（实测 GPU 利用率只有 0~34%，瓶颈是 CPU/仿真器）。
+
+### 6. GPU 预留器会正确拒绝，别绕过它
+
+B1 test 第一次被拒：GPU7 扣掉给别人预留的 8 GB 后只剩 4.1 GB，放不下 6 个分片
+（每个 4715 MiB）。这是护栏在工作，改成串行排队即可。
 
 ---
 
 ## 七、下一步
 
-### 立刻可做（不占 GPU）
-
-1. **新增 B4 臂**（第六节的 (a)）
-2. 读 `result/p7/*.json` 熟悉结果口径
-
-### 等机器负载 < 40 后（当前 181,是唯一硬阻塞）
-
-```bash
-# 两组并行,4 卡（DDP 端口冲突已修,可安全并行）
-cd source/peract && source ../../run/env.sh
-
-# B2：子任务指令,无码
-CUDA_VISIBLE_DEVICES=a,b setsid nohup python train.py --config-name=stage3 \
-    stage3.arm=B2 framework.training_iterations=40001 \
-    framework.num_weights_to_keep=30 > ../../log/p5/B2.trainN.out 2>&1 &
-
-# B4：子任务指令 + v2 注入
-CUDA_VISIBLE_DEVICES=c,d setsid nohup python train.py --config-name=stage3 \
-    stage3.arm=B4 stage3.injector=v2 framework.training_iterations=40001 \
-    framework.num_weights_to_keep=30 > ../../log/p5/B4.train1.out 2>&1 &
-```
-
-**启动后必须验证**：日志出现 `Resuming training from iteration 0`、
-`Stage 3 注入层已挂载(v2)`、`冻结边界：可训参数 2,5xx,xxx`,且 `Train Step` 在推进。
-
-### 训练完成后
-
-```bash
-# val 选点（零成本）
-python scripts/stage3_eval.py run --arm B4 --ckpt 40000 --split val \
-    --episodes 25 --shards 12 --gpu a,b --stagger 20 --display-base 130
-
-# test（方案已定：template + plan）
-python scripts/stage3_eval.py run --arm B4 --ckpt <best> --split test \
-    --episodes 25 --shards 12 --gpu a,b --stagger 20 --display-base 130
-```
-
-### B4 的判据（**提前定死,避免事后找理由**）
+### 用户设定的优先级
 
 ```
-B4@40000 > B1@40000(35.33%) + 3 pp   →  注入机制确实是瓶颈,方向对
-B4 ≈ B1                              →  **注入形式不是瓶颈**,问题在码本身携带的信息
-                                         （0.91 bit 增量 + 细节码 82.8% 退化）
-B4 < B1 − 3 pp                       →  注入有害,回退并重新设计
+确定 X3 最终方案  >  改进 B4  >  其他
 ```
+
+但按第三节的证伪链，**X3 已无继续投入的价值**（`flat` 证明语言通路无效）。
+建议向用户说明后就地定版，把优先级实质转到 B4。
+
+### 立刻可做（免费）
+
+1. **诊断 v3.6 的 `open_drawer` 回归**（轨迹在 `B4_x3_v36_test/traces/`）
+2. **B1 test 重复 2 次**（免费，用户已同意并行安排）
+3. B3 的 test（补齐主表；B3 是 v1 注入层，与 B4 对照）
+
+### 需要讨论后再做
+
+**带码本门控重训 B4**（~10 h GPU，4 卡）。依据：
+- 门控在**评测时**就能让未覆盖组涨 9 pp（3.4）
+- B4 训练 loss 高于无码基线（3.3）—— 注入层正在拟合无意义的码
+- 训练期就带门控，注入层不必再去拟合那些噪声
+
+这是目前唯一还有净收益空间、且有三条独立证据支撑的方向。
+
+### 用户的最终目标与现实差距
+
+用户希望 **X3 + B4 超越 B1 十个百分点**。当前 test 上：
+
+```
+B1  39.33          目标 ≈ 49.3
+B4  32.33          差距 −17.0 pp
+B4·X3 v3.6 29.33   差距 −20.0 pp
+```
+
+**必须如实告知：按现有证据，这个目标不是靠调 planner 能达到的。**
+拆子任务本身先扣分（test 上 B2 34.00 < B1 39.33），码本没有补回来
+（B4 32.33 < B2 34.00）。
 
 ---
 
-## 八、待决策 / 未解决的问题
-
-| # | 问题 | 现状 |
-|---|---|---|
-| 1 | **B4 臂定义用 (a) 还是 (b)** | 未定,建议 (a) |
-| 2 | **B2 的预期** | 用户希望 B2 < B1 且 B2 < B3（证明「需要专门模块」）。但按现有证据预测 **B2 ≈ 35.3%** —— 若真的明显偏低,反而会推翻「码完全惰性」的结论,是重要发现。**不应朝期望方向调,如实报告** |
-| 3 | **test 的 ckpt 选择** | 用户定：B3/B4 可跨 ckpt 在 test 上选最优；B1 固定用与 B3 相同的 step（40000）。这是有意让给 B3/B4 的不对称,已接受 |
-| 4 | **在线 planner 是否继续** | 三版都输给模板法（26.67 / 22.33 / v3.1 未测成）。诊断：注入指令落在训练分布内的比例 **模板法 100% vs 在线 56.6%**（r=+0.29,重要但非唯一原因）。v3.1 已实现候选指令清单等修复,**未验证** |
-| 5 | `slide_block_to_color_target` | CSV 先验（5 段）、离线真值（2.7 段）、cache 质量（16.3% pose-adjust,断层第一）三方对不上。**用户已决定暂不处理** |
-| 6 | `place_cups` / `put_groceries_in_cupboard` | 所有臂上几乎恒为 0,合计压低均值约 8 pp。与「独占原子样本稀缺」一致（`VLA_Design §7 R2`） |
-| 7 | 细节码 82.8% 退化 | 是 Stage 0/1 的问题,修它要回到码本预训练。**用户已决定暂不讨论** |
-| 8 | 未 commit | 全部改动都在工作区,**没有任何 commit**。用户明确要求过「不要打 git 原子提交」 |
-
----
-
-## 九、用户设定的工作规则（必须遵守）
+## 八、用户设定的工作规则（必须遵守）
 
 ```
-1. 设计文档仅供参考,不是约束
-2. **分步规划,执行前必须先与用户确认** —— 曾因未经同意就执行被明确批评
-3. 有异议/发现缺陷/有更好建议要提出讨论
+1. 设计文档仅供参考，不是约束
+2. **分步规划，执行前必须先与用户确认** —— 曾因未经同意就执行被明确批评
+3. 有异议 / 发现缺陷 / 有更好建议要提出讨论
 4. **每次都要报告改了哪些文件、加了哪些文件**
-5. 显卡：盘子上限 **4 张**（自己在跑的卡也计入）；只占空闲 > 30 GB 的卡；
-   **绝不 kill 别人的进程,不影响别人的作业**
-6. 目录约定：权重 `checkpoints/`,结果 `result/`,日志 `log/`；**不用 `runs/`**
-7. 磁盘空间由用户负责,只需报告是否不够
-8. VLM 调用有成本（实测 ¥0.0139/次,300 局约 ¥40）—— planner 迭代一律先用 120 局
+5. 显卡：盘子上限 4 张（自己在跑的也计入）；空闲显存够就可与别人共用，
+   共用卡预留 8 GB；**绝不 kill 别人的进程**；用完即释放
+6. 目录约定：权重 `checkpoints/`，结果 `result/`，日志 `log/`；不用 `runs/`
+7. 磁盘空间由用户负责，只需报告是否不够
+8. VLM 成本 ¥0.0139/次，300 局约 ¥33–40。planner 迭代先用 120 局探路
+9. 汇总口径：**报 mean 和 max，以 mean 为分析依据**；两个臂必须同口径
+10. 噪声涨跌可忽略；X3 定版后 B4 会重复 3 次实验
+```
+
+---
+
+## 九、机器与环境
+
+```
+conda env    aavla（py3.10, torch 2.4.1+cu121, numpy 1.26）
+入口         cd /data0/xiexiao/VQAP && source run/env.sh
+GPU          8 × RTX 5880 Ada（49 GB），共享机器，约 100 个用户
+             别人长期占 GPU1(23 GB) 和 GPU7(37 GB)
+CPU          208 核；12 分片时 load ≈ 40，磁盘 util ≈ 45%
+replay       aavla_data/replay/seen12/... 165,773 样本 / 202 GB / 三臂共享只读
+数据         aavla_data/rlbench/{train,val,test}/ 各 18 任务 × 25 局
+             （val 和 test 每任务只有 25 局，这是样本量的硬上限）
+显卡看门     python tools/gpu_reserver.py status
 ```
 
 ---
@@ -428,21 +373,7 @@ B4 < B1 − 3 pp                       →  注入有害,回退并重新设计
 
 | 文档 | 内容 |
 |---|---|
-| `Exp_Design.md` | 实验设计 + **第七节：实测结果汇总** |
+| `Exp_Design.md` | 实验设计 + **第七节：实测结果汇总（已更新到本轮）** |
 | `VLA_Design.md` | Stage 3 集成 / Planner / cache |
-| `Adapter_Design.md` | Stage 2 Adapter 结构；**§5 码向量注入的接口契约** |
+| `Adapter_Design.md` | Stage 2 Adapter 结构；§5 码向量注入的接口契约 |
 | `VQAP_Design.md` | Stage 0/1 码本预训练 |
-
----
-
-## 附：机器与环境
-
-```
-conda env       aavla（py3.10, torch 2.4.1+cu121, numpy 1.26）
-入口            cd source/peract && source ../../run/env.sh
-GPU             8 × RTX 5880 Ada（49 GB）,共享机器,96 个用户
-replay          aavla_data/replay/seen12/... 165,773 样本 / 202 GB / 三臂共享只读
-磁盘            /data0 约 168 GB 可用（28T/29T）
-显卡看门        python tools/gpu_reserver.py watch --interval 45
-                （盘子 4 张；要用卡时 hold --gpus a,b,用完 unhold）
-```
