@@ -278,6 +278,10 @@ class _SubtaskAgent:
                     "k_global": self._cached_codes[0],
                     "k_detail": self._cached_codes[1],
                     "plan_k_global": int(st["k_global"]),
+                    # Adapter 对这次预测有多大把握。码本没见过这个场景时
+                    # 本该低 —— 用来检验「按置信度门控」是否比任务白名单更有原则。
+                    "conf": getattr(self._code_source, "last_conf", None),
+                    "conf_detail": getattr(self._code_source, "last_conf_detail", None),
                 }
         return self._cached_codes
 
