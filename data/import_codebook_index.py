@@ -12,7 +12,7 @@
 	5. 全程 float32 + eval 模式，硬量化取 argmin，避免 bf16 在近邻边界上翻码。
 
 用法：
-	export COPPELIASIM_ROOT=/home/weizeming/weizeming/CoppeliaSim
+	export COPPELIASIM_ROOT=/root/autodl-tmp/CoppeliaSim
 	export LD_LIBRARY_PATH=$COPPELIASIM_ROOT:$LD_LIBRARY_PATH
 	python data/import_codebook_index.py \
 		--checkpoint checkpoints/vqap_pretrain/stage1/latest.pth \
