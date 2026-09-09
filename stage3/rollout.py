@@ -378,6 +378,9 @@ class Stage3RolloutGenerator(RolloutGenerator):
             rec["rollbacks"] = getattr(planner, "rollback_log", [])
             # 断线退化过的局必须可识别，否则成绩单里混着模板法的步骤而看不出来。
             rec["plan_source"] = getattr(planner, "plan_source", "vlm")
+            # v3.5：续写了什么、第几次 —— 事后要能算出「续写过的局」成功率，
+            # 不行就用 AAVLA_ALLOW_EXTEND=0 关掉。
+            rec["extends"] = getattr(planner, "extends", [])
             (self._trace_dir / f"{task}_ep{episode}.json").write_text(
                 json.dumps(rec, ensure_ascii=False))
         except Exception as e:                       # 诊断数据不该拖垮评测

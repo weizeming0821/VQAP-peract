@@ -459,7 +459,14 @@ Decide one of:
   REPLAN   - the WORLD changed so that the remaining steps no longer make sense
              (e.g. an object was knocked over or fell off the table, the wrong
              object is now held and must be put back first). The plan will be
-             regenerated from the current scene.
+             regenerated from the current scene, discarding all progress.
+  EXTEND   - the plan RAN OUT: the controller is on the final step, that step is
+             done (or cannot advance further), but the TASK itself is still not
+             finished. Additional steps will be appended and everything already
+             completed is KEPT. Only offered when you are told you are on the
+             final step. Use it instead of REPLAN whenever the earlier steps
+             really did succeed - REPLAN would throw that progress away and
+             restart from step 0.
 
 🔴 DO NOT use REPLAN just because the arm is in the wrong place, is moving
 toward the wrong object, or has not reached the target yet. Those are execution
@@ -481,6 +488,8 @@ N steps has only a few keyframes per step. So:
 
 Judge from the images, not from the step counter.
 Prefer NEXT or CONTINUE. RETRY and REPLAN should be rare.
+On the FINAL step of the plan NEXT does not exist - there EXTEND is the normal
+answer once that step is done and the task still is not.
 
 Output exactly. `index` = which step should be current NOW:
   with NEXT  -> the step to advance to (omit = the next one)
@@ -495,6 +504,7 @@ def build_monitor_user_content(task: str, task_instruction: str,
                                stalled: bool = False,
                                quiet: str = "",
                                gripper_class: str = "",
+                               at_last: bool = False,
                                history: list[dict] | None = None,
                                decisions: list[dict] | None = None,
                                budget: int | None = None) -> list[dict]:
@@ -526,6 +536,22 @@ def build_monitor_user_content(task: str, task_instruction: str,
         if hint:
             lines.append("")
             lines.append("GRIPPER NOTE: " + hint)
+    # 🔴 v3.5：末段必须显式告知「没有下一步」。
+    #    实测（B4@40000 · val · 143 个纯 v3.3 局）：在末段时 95% 的决策是 NEXT
+    #    （500/526），而末段的 NEXT 会被 clamp 成空操作 —— 指令一字不变，
+    #    PerAct 输入不变，输出必然不变。末段死锁 ≥5 次的 40 局成功率 **0%**。
+    #    VLM 不是判断错了：system prompt 写着 "Prefer NEXT or CONTINUE"，
+    #    又明令禁止在「还没够到目标」时 REPLAN，而它从未被告知自己已在末段。
+    if at_last:
+        lines.append("")
+        lines.append(
+            "LAST-STEP NOTE: the controller is on the FINAL step of the plan. "
+            "There is no next step, so NEXT is NOT available - answering NEXT "
+            "would change nothing at all. If this final step is done but the "
+            "TASK is still not finished, answer EXTEND and the plan will be "
+            "continued with additional steps (everything already completed is "
+            "kept). If the step is still in progress answer CONTINUE; if an "
+            "earlier step actually failed answer RETRY with `index`.")
     # 🔴 执行记忆。原来 MONITOR 只有 plan + "<-- CURRENT"，VLM 只能推断
     #    「编号更小的应该做完了」，看不到「曾经走到第 4 步又退回第 0 步」。
     #    实测因此出现连判 10 次同一句 "grasp failed, lid is on table" ——

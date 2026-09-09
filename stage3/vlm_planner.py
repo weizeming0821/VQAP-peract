@@ -316,6 +316,19 @@ def gripper_class(action: str) -> str:
 MAX_RETRY = 4
 #: 每局最多重规划几次。实测 6% 的局触顶 2；v3 把停滞导向 REPLAN 后需求上升。
 MAX_REPLAN = 4
+# ------------------------------------------------------------------ v3.5
+#: 每局最多「续写计划」几次。
+#: 🔴 由来（B4@40000 · val 300 局 · 143 个纯 v3.3 局的轨迹）：
+#:      末段的决策 95% 是 NEXT，而末段 NEXT 被 clamp —— target=None，
+#:      指令一字不变，PerAct 输入不变，输出必然不变。500/886 次调用白烧。
+#:      末段死锁 ≥5 次的局共 40 个，**成功率 0%**；其余局 67%。
+#:      而它们中位在 t=9 就走完计划（中位 4 段），之后 17 步无指令可发。
+#:    缺的不是更好的段，是**更多的段** —— 88% 的成功局根本没走到末段。
+MAX_EXTEND = int(os.environ.get("AAVLA_MAX_EXTEND", "2"))
+#: 计划总段数上限，防止反复续写把计划撑爆。
+MAX_SEGMENTS = int(os.environ.get("AAVLA_MAX_SEGMENTS", "10"))
+#: 是否允许续写。关掉即退化成 v3.4 行为（末段 NEXT 仍为空操作）。
+ALLOW_EXTEND = os.environ.get("AAVLA_ALLOW_EXTEND", "1") != "0"
 
 
 class OnlineVLMPlanner:
@@ -380,6 +393,9 @@ class OnlineVLMPlanner:
         self.code_epoch = 0              # NEXT/RETRY/REPLAN 时 +1 -> 让 Adapter 重算
         self.retry = 0
         self.n_replan = 0
+        self.n_extend = 0                # v3.5：续写过几次
+        self.extends: list[dict] = []    # 每次续写追加了什么，供事后判定有效性
+        self._plan_exhausted = False     # 续写预算用尽 + 仍在末段 -> 停止再问
         self.prev_gripper: float | None = None
         self.prev_pose = None          # 上一帧的末端位姿（xyz），用于位移判定
         self.quiet = 0                 # 连续「静止」的帧数
@@ -482,6 +498,12 @@ class OnlineVLMPlanner:
             self.stats["skipped_while_down"] = \
                 self.stats.get("skipped_while_down", 0) + 1
             return
+        if self._plan_exhausted and at_last:
+            # 续写预算用尽且仍停在末段 —— 已经确认没有可执行的动作了，
+            # 再问也只会拿回同一个空操作。这正是旧版烧掉 56% 调用的地方。
+            self.stats["skipped_exhausted"] = \
+                self.stats.get("skipped_exhausted", 0) + 1
+            return
         n_calls = self.stats["plan_call"] + self.stats["monitor_call"]
         if n_calls >= MAX_CALLS:
             self.stats["budget_exhausted"] += 1
@@ -494,7 +516,8 @@ class OnlineVLMPlanner:
 
         d, tgt, reason = self._monitor(gripper_open, frame,
                                        stalled=stalled, quiet=quiet,
-                                       gripper_class=gclass if flip else "")
+                                       gripper_class=gclass if flip else "",
+                                       at_last=at_last)
         self.stats[d] = self.stats.get(d, 0) + 1
         self.decisions.append({"t": self.t, "trigger": why, "decision": d,
                                "idx": self.idx, "target": tgt, "reason": reason})
@@ -539,6 +562,14 @@ class OnlineVLMPlanner:
     # ---------------------------------------------------------- 决策落地
     def _apply(self, d: str, frame, target: int | None = None) -> None:
         last = len(self.subtasks) - 1
+        # 🔴 v3.5：末段的 NEXT 判为 EXTEND，而不是 clamp 成空操作。
+        #    NEXT 的字面语义是「这一步做完了，去下一步」——没有下一步时，
+        #    忠实的执行就是造一个出来。这是翻译，不是替 VLM 做决定。
+        #    旧行为：target=None，指令一字不变 → PerAct 输入不变 → 输出必然
+        #    不变 → 死锁到超时。实测末段死锁 ≥5 次的 40 局成功率 0%。
+        if d == "NEXT" and self.idx >= last:
+            self.stats["next_at_last"] = self.stats.get("next_at_last", 0) + 1
+            d = "EXTEND" if ALLOW_EXTEND else "CONTINUE"
         if d == "NEXT":
             if self.idx < last:
                 # 允许一次跨多段（上限 MAX_ADVANCE）。v1 每次只能进 1 段，
@@ -593,6 +624,33 @@ class OnlineVLMPlanner:
             self.used = 0
             self.retry = 0
             self.code_epoch += 1
+        elif d == "EXTEND":
+            # 「前面的都做完了，但任务还没完」—— 保留已完成的段，在末尾追加。
+            # 与 REPLAN 的区别：REPLAN 丢弃全部进度、idx 归零，会让已经抓住
+            # 扫帚、搬到灰尘旁的手臂从「approach the broom handle」重头再来。
+            if (not ALLOW_EXTEND or self.n_extend >= MAX_EXTEND
+                    or len(self.subtasks) >= MAX_SEGMENTS):
+                self.stats["extend_blocked"] = self.stats.get("extend_blocked", 0) + 1
+                # 已确认无路可走：本局停止再问，省下剩余的空转调用。
+                self._plan_exhausted = True
+                return
+            self.n_extend += 1
+            # 走到末段说明前面的段都被推进过了，据此告诉 VLM「已完成什么」；
+            # 它再看当前画面给出**剩余**动作（build_plan_user_content 的 done 参数）。
+            self.done.extend(self.subtasks[self.idx:])
+            more = self._plan(frame)
+            if not more:
+                self._plan_exhausted = True
+                return
+            n0 = len(self.subtasks)
+            self.subtasks = self.subtasks + more
+            self.idx = n0
+            self.used = 0
+            self.retry = 0
+            self.code_epoch += 1
+            self.extends.append({"t": self.t, "n": self.n_extend,
+                                 "added": [f"{s['action']}: {s['instruction']}"
+                                           for s in more]})
         # CONTINUE：什么都不做
 
     # ---------------------------------------------------------- VLM 调用
@@ -664,7 +722,8 @@ class OnlineVLMPlanner:
         return plan
 
     def _monitor(self, gripper_open, frame: dict, stalled: bool = False,
-                 quiet: str = "", gripper_class: str = "") -> tuple[str, int | None, str]:
+                 quiet: str = "", gripper_class: str = "",
+                 at_last: bool = False) -> tuple[str, int | None, str]:
         from planner.prompts import (build_monitor_system_prompt,
                                      build_monitor_user_content)
         msgs = [{"role": "system", "content": build_monitor_system_prompt()},
@@ -672,6 +731,7 @@ class OnlineVLMPlanner:
                     self.task, self.task_instruction, self.subtasks, self.idx,
                     self.used, gripper_open, self._images(frame),
                     stalled=stalled, quiet=quiet, gripper_class=gripper_class,
+                    at_last=at_last and ALLOW_EXTEND,
                     history=self.history if USE_HISTORY else None,
                     decisions=self.decisions if USE_HISTORY else None,
                     budget=EPISODE_BUDGET if USE_HISTORY else None)}]
@@ -749,7 +809,7 @@ def _parse_plan(text: str) -> list[dict]:
     return [{"action": str(x["action"]).strip(), "raw": x} for x in plan]
 
 
-_DECISIONS = ("CONTINUE", "NEXT", "RETRY", "REPLAN")
+_DECISIONS = ("CONTINUE", "NEXT", "RETRY", "REPLAN", "EXTEND")
 
 
 def _parse_decision(text: str) -> tuple[str, int | None, str]:
@@ -769,7 +829,7 @@ def _parse_decision(text: str) -> tuple[str, int | None, str]:
         pass
     up = s.upper()
     # 顺序有意：REPLAN/RETRY 比 CONTINUE 罕见，先匹配它们避免被子串吞掉
-    for v in ("REPLAN", "RETRY", "NEXT", "CONTINUE"):
+    for v in ("REPLAN", "EXTEND", "RETRY", "NEXT", "CONTINUE"):
         if v in up:
             return v, None, "(parsed from raw text)"
     raise PlannerError(f"无法从输出解析 decision: {s[:120]!r}")
