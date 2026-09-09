@@ -127,5 +127,29 @@ sysp = build_monitor_system_prompt()
 t("system prompt 定义了 EXTEND", "EXTEND" in sysp)
 t("说明 EXTEND 保留进度而 REPLAN 丢弃", "discarding all progress" in sysp and "KEPT" in sysp)
 
+print("=== 空计划不再杀分片（v3.5 首跑被这一行打死 9 个分片）===")
+class EmptyClient:
+    def chat(self, msgs, model=None):
+        return {"content": json.dumps({"plan": []})}
+pe = make(3); pe.idx = 0
+pe._client = EmptyClient()
+pe._apply("NEXT", FRAME); pe._apply("NEXT", FRAME)      # 推到末段
+try:
+    pe._apply("NEXT", FRAME)                            # 末段 -> EXTEND -> 空计划
+    raised = False
+except Exception as e:
+    raised = True
+t("EXTEND 拿到空计划不抛异常", not raised)
+t("标记 extend_empty", pe.stats.get("extend_empty") == 1, pe.stats)
+t("置 _plan_exhausted，本局停止再问", pe._plan_exhausted is True)
+t("保留原计划不被污染", len(pe.subtasks) == 3, len(pe.subtasks))
+
+print("=== 开局 PLAN 拿到空计划 → 回落模板（不杀分片）===")
+pf = V.OnlineVLMPlanner("t", "ti", EmptyClient(), prior=[["push"]], phrasings=[],
+                        fallback=[seg("push", 9)])
+pf.prime(1.0, FRAME)
+t("开局空计划回落到模板", pf.plan_source == "template_fallback", pf.plan_source)
+t("记了 empty_plan", pf.stats.get("empty_plan") == 1, pf.stats)
+
 print("\n" + ("全部通过 ✅" if ok else "有失败 ❌"))
 sys.exit(0 if ok else 1)

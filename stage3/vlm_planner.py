@@ -638,8 +638,15 @@ class OnlineVLMPlanner:
             # 走到末段说明前面的段都被推进过了，据此告诉 VLM「已完成什么」；
             # 它再看当前画面给出**剩余**动作（build_plan_user_content 的 done 参数）。
             self.done.extend(self.subtasks[self.idx:])
-            more = self._plan(frame)
+            # 续写失败（VLM 答「没有剩余动作」/ 解析失败 / 断线）不是致命错误：
+            # 标记为已用尽、保留现有计划继续跑完本局即可。**不能**在这里回落到
+            # 模板计划 —— 那会把整份模板计划追加到末尾，与「续写」语义不符。
+            try:
+                more = self._plan(frame, allow_fallback=False)
+            except PlannerError:
+                more = []
             if not more:
+                self.stats["extend_empty"] = self.stats.get("extend_empty", 0) + 1
                 self._plan_exhausted = True
                 return
             n0 = len(self.subtasks)
@@ -665,7 +672,7 @@ class OnlineVLMPlanner:
             raise PlannerError("observation 里没有可用的相机图像")
         return out
 
-    def _plan(self, frame: dict) -> list[dict]:
+    def _plan(self, frame: dict, allow_fallback: bool = True) -> list[dict]:
         from planner.prompts import (build_plan_system_prompt,
                                      build_plan_user_content)
         from planner.contract import (use_codebook, normalize_instruction,
@@ -683,7 +690,7 @@ class OnlineVLMPlanner:
             raw = _parse_plan(self._client.chat(msgs)["content"])
         except Exception as e:
             self.stats["fail"] += 1
-            if self._fallback:
+            if self._fallback and allow_fallback:
                 # 断线不该让整个分片陪葬：用模板计划把这一局跑完，并在轨迹里
                 # 标记来源，分析时可以单独剔除或对照。
                 self.stats["plan_fallback"] = self.stats.get("plan_fallback", 0) + 1
@@ -715,6 +722,15 @@ class OnlineVLMPlanner:
                          "k_global": -1, "k_detail": [-1] * 9,  # 必须由 Adapter 出
                          "n_keyframes": 1})
         if not plan:
+            # 🔴 空计划与「调用失败」同等处理。EXTEND 会在局中调 _plan 问
+            #    「还剩什么要做」，而 VLM 完全可能答「没有了」—— 这是合法回答，
+            #    不该让整个分片死掉。2026-09-09 实测：v3.5 首跑 9 个分片
+            #    被这一行打死，300 局只跑出 119 局。
+            self.stats["empty_plan"] = self.stats.get("empty_plan", 0) + 1
+            if self._fallback and allow_fallback:
+                self.stats["plan_fallback"] = self.stats.get("plan_fallback", 0) + 1
+                self.plan_source = "template_fallback"
+                return [dict(x) for x in self._fallback]
             raise PlannerError("vlm-plan 生成了空计划")
         self.decisions.append({"t": self.t, "decision": "PLAN",
                                "plan": [f"{s['action']}: {s['instruction']}"
