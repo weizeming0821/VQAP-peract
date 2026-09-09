@@ -753,12 +753,16 @@ query 有区分度但范数太小，经 `q_proj` 后打分幅度不足以让 sof
 
 `Exp_Design.md` 声明 B 原称"UnSeen 6 个任务中，仅 `stack_cups` 完全不在 AtomAction_Dataset 中"。**实测是 4 个不在**（已扫描含 `pose-adjust` 在内的全部 18 个动作目录）：
 
-| 部署任务 | 在 AtomAction（69 任务）中？ |
+| 部署任务（官方 18，2026-09 起全部属 Seen18） | 在 AtomAction（69 任务）中？ |
 |---|---|
-| Seen12 的 9 个：close_jar, light_bulb_in, open_drawer, place_shape_in_shape_sorter, push_buttons, put_groceries_in_cupboard, reach_and_drag, stack_blocks, sweep_to_dustpan | ✅ |
-| **Seen12 的 3 个：`place_cups`, `slide_block_to_target`, `stack_wine`** | ❌ |
-| UnSeen6 的 5 个：insert_onto_square_peg, meat_off_grill, put_item_in_drawer, put_money_in_safe, turn_tap | ✅ |
-| **UnSeen6 的 1 个：`stack_cups`** | ❌ |
+| 14 个：close_jar, light_bulb_in, open_drawer, place_shape_in_shape_sorter, push_buttons, put_groceries_in_cupboard, reach_and_drag, stack_blocks, sweep_to_dustpan, insert_onto_square_peg, meat_off_grill, put_item_in_drawer, put_money_in_safe, turn_tap | ✅ |
+| **4 个：`place_cups`, `slide_block_to_target`, `stack_wine`, `stack_cups`** | ❌ |
+
+> **⚠️ 与 `VLA_Design §7 R2` 的「5 个不在」并不矛盾，是任务命名口径不同**：AtomAction 收录的是**上游 RLBench 的同族单 variation 任务**（`sweep_to_dustpan` / `slide_block_to_target` / `stack_wine`），而部署用的是 PerAct fork 的多 variation 版本（`sweep_to_dustpan_of_size` / `slide_block_to_color_target` / `place_wine_at_rack_location`）。
+> 按 fork 名严格比对 → 5 个不在；把同族上游任务算作命中 → 4 个不在（`sweep_to_dustpan` 被算作命中）。
+> **论文中报哪个口径必须写清楚**，两处不得混用。
+
+> **2026-09 改版备注**：原表按 Seen12 / UnSeen6 分组，该划分已作废（见 `VLA_Design §2.4`）。上表按官方 18 任务重新组织；新 UnSeen 8 个任务的码本覆盖情况见【声明 B′】——Tier-A 6 个全在 AtomAction 内，Tier-B 2 个全不在。
 
 **叠加风险**：`place_cups`（独占原子 `hang`）与 `stack_wine`（独占原子 `insert`）恰是"独占原子任务"，而 `hang` 全库仅 **100 条且只来自 1 个任务**（`hang_frame_on_hanger`）、`insert` 仅 **283 条**（来自 4 个任务，不含 stack_wine）。**最稀缺的原子，其部署载体任务恰好没见过。**
 

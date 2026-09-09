@@ -38,11 +38,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-SEEN12 = ["close_jar", "light_bulb_in", "open_drawer", "place_cups",
-          "place_shape_in_shape_sorter", "push_buttons",
-          "put_groceries_in_cupboard", "reach_and_drag",
-          "slide_block_to_color_target", "stack_blocks",
-          "place_wine_at_rack_location", "sweep_to_dustpan_of_size"]
+# 任务名单的真源在 stage3/tasks.py。--tasks 默认审全部 Seen18。
+from stage3.tasks import SEEN18                                       # noqa: E402
 VIEWS = ("front", "wrist")
 
 
@@ -90,7 +87,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--episodes", type=int, default=10, help="每任务多少局")
-    ap.add_argument("--tasks", nargs="+", default=SEEN12)
+    ap.add_argument("--tasks", nargs="+", default=SEEN18)
     ap.add_argument("--split", default="train")
     ap.add_argument("--model", default=None)
     ap.add_argument("--out", default=str(REPO_ROOT / "result" / "p7" / "plan_audit.json"))

@@ -59,13 +59,10 @@ RESULT = REPO_ROOT / "result" / "p5_train"
 OFFICIAL = (PERACT_ROOT / "ckpts" / "multi" / "PERACT_BC" / "seed0" /
             "weights" / "600000" / "QAttentionAgent_layer0.pt")
 
-SEEN12 = ["close_jar", "light_bulb_in", "open_drawer", "place_cups",
-          "place_shape_in_shape_sorter", "push_buttons",
-          "put_groceries_in_cupboard", "reach_and_drag",
-          "slide_block_to_color_target", "stack_blocks",
-          "place_wine_at_rack_location", "sweep_to_dustpan_of_size"]
-UNSEEN6 = ["insert_onto_square_peg", "meat_off_grill", "put_item_in_drawer",
-           "put_money_in_safe", "stack_cups", "turn_tap"]
+# 任务划分的真源在 stage3/tasks.py。这里曾经抄过一份 SEEN12/UNSEEN6，
+# 而同一份名单在 planner_cache / plan_audit / preflight 里还各有一份 ——
+# 任务集是评测口径的一部分，改一处漏三处不会报错，只会安静地评错任务集。
+from stage3.tasks import resolve as resolve_tasks     # noqa: E402
 
 #: B0 的伪 checkpoint 步数。用官方的 600000 以示它来自 peract_600k，未经本项目训练。
 B0_STEP = 600000
@@ -73,6 +70,47 @@ B0_STEP = 600000
 
 def arm_dir(exp: str, arm: str, seed: int = 0) -> Path:
     return CKPT_ROOT / exp / arm / f"seed{seed}"
+
+
+def rotate_eval_csv_if_schema_changed(d: Path, tasks: list[str]) -> Path | None:
+    """任务集与现有 `eval_data.csv` 的表头不符时，把旧文件归档，让表头重写。
+
+    🔴 YARR 的 CSVWriter 只在**文件不存在**时写表头
+       （`log_writer.py` 里 `should_write_train_header = not os.path.exists(...)`）。
+       换一批任务再评，列数变了而表头不变 —— 新行会与旧表头**逐列错位**，
+       按列名取成绩全部落空（`snapshot()` 拿到一堆 NaN，均值成 None 后直接抛
+       `TypeError: unsupported format string passed to NoneType.__format__`）。
+       更坏的情况是列数恰好相同：错位悄无声息，读出来的是**另一个任务的成绩**。
+
+    分片路径也需要它：`_merge_shards` 会把新结果与既有 `eval_data.csv` 外连接，
+    旧口径的任务列会作为 NaN 列留下来，把「列数 == 期望任务数」的硬校验顶掉。
+
+    2026-09 的 Seen12 → Seen18/UnSeen 改版正踩在这个点上，所以必须常备。
+
+    归档而不是删除：旧文件里可能存着不可再现的历史成绩。
+    返回归档路径；无需轮转时返回 None。
+    """
+    csv_path = d / "eval_data.csv"
+    if not csv_path.is_file():
+        return None
+    head = csv_path.read_text().splitlines()
+    header = head[0].split(",") if head else []
+    need = [f"eval_envs/return/{t}" for t in tasks]
+    extra = [c for c in header if c.startswith("eval_envs/return/") and c not in need]
+    missing = [c for c in need if c not in header]
+    # 缺列会错位，多列会顶掉完整性校验 —— 两种都要轮转
+    if not missing and not extra:
+        return None
+    archive = d / f"eval_data.{time.strftime('%Y%m%d_%H%M%S')}.csv"
+    csv_path.rename(archive)
+    why = []
+    if missing:
+        why.append(f"缺 {[c.rsplit('/', 1)[-1] for c in missing][:3]}…")
+    if extra:
+        why.append(f"多出 {[c.rsplit('/', 1)[-1] for c in extra][:3]}…")
+    print(f"  ⚠️ eval_data.csv 的表头与本次任务集不符（{'；'.join(why)}），"
+          f"已归档为 {archive.name}，本轮重写表头。")
+    return archive
 
 
 # ------------------------------------------------------------------ setup-b0
@@ -440,8 +478,10 @@ def cmd_run(a) -> int:
     if getattr(a, "display_base", None):
         os.environ["AAVLA_DISPLAY_BASE"] = str(a.display_base)
 
-    tasks = SEEN12 if a.tasks == ["seen12"] else (
-        UNSEEN6 if a.tasks == ["unseen6"] else a.tasks)
+    tasks = resolve_tasks(a.tasks)
+    # 🔴 必须在任何分片启动之前轮转一次，且**只轮转一次**：分片是并发起的，
+    #    每片各转一次会互相抢同一个文件。
+    rotate_eval_csv_if_schema_changed(arm_dir(a.exp, a.arm, a.seed), tasks)
     log = (REPO_ROOT / "log" / "p5" / f"{a.arm}.eval.out") if not a.foreground else None
 
     # --wait-gpu：共享集群上显存随时被别人吃掉，与其失败退出不如等。
@@ -661,9 +701,7 @@ def cmd_plans(a) -> int:
             return 2
         return 0
 
-    tasks = SEEN12 if a.tasks == ["seen12"] else (
-        UNSEEN6 if a.tasks == ["unseen6"] else
-        (SEEN12 + UNSEEN6 if a.tasks == ["all18"] else a.tasks))
+    tasks = resolve_tasks(a.tasks)
     cache = PlannerCache(a.cache_dir)
 
     if a.planner == "oracle":
@@ -870,8 +908,9 @@ def main() -> int:
         p = sub.add_parser(name)
         p.add_argument("--arm", required=True)
         p.add_argument("--tasks", nargs="+",
-                       default=defaults.get("tasks", ["seen12"]),
-                       help="任务名，或 seen12 / unseen6")
+                       default=defaults.get("tasks", ["seen18"]),
+                       help="任务名，或任务组：seen18 / unseen10 / unseen_a / "
+                            "unseen_b / all28（历史：seen12 / unseen6）")
         p.add_argument("--split", default="val", choices=["train", "val", "test"])
         p.add_argument("--episodes", type=int, default=defaults.get("episodes", 25))
         p.add_argument("--ckpt", default=defaults.get("ckpt", "missing"),
@@ -923,8 +962,9 @@ def main() -> int:
                         "oracle 用每局自己的真值分段（仅 train split）")
     p.add_argument("--split", default="val", choices=["train", "val", "test"])
     p.add_argument("--episodes", type=int, default=25, help="每任务多少局")
-    p.add_argument("--tasks", nargs="+", default=["seen12"],
-                   help="任务名，或 seen12 / unseen6 / all18")
+    p.add_argument("--tasks", nargs="+", default=["seen18"],
+                   help="任务名，或任务组：seen18 / unseen10 / all28"
+                        "（历史：seen12 / unseen6）")
     p.add_argument("--bank-split", default="train",
                    help="模板取自哪个 split 的离线 cache（默认 train）")
     p.add_argument("--cache-dir",

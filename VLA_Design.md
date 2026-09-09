@@ -67,9 +67,13 @@
 
 `peract_600k` 的 `config.yaml` 实测显示它训练在 **21 个任务**上（论文 18 个 + `change_channel` / `set_clock_to_time` / `put_rubbish_in_color_bin`），600k 步。
 
-**连带后果：UnSeen 的定义必须改写。**
+**连带后果：UnSeen 必须从这 21 个任务之外选取**（2026-09 改版，见 §2.4）。
 
-> **【声明 A｜UnSeen 的定义】** UnSeen 指**未参与 Stage 3 微调**的任务。PerAct 主干在其 600k 步预训练中**已经见过**这些任务的完整轨迹。因此 Exp2 测的是「注入模块 + 码本的组合泛化能力」，**不是**「任务从未见过」。
+> **【声明 A′｜UnSeen 的定义】** UnSeen 指 **PerAct 主干从未见过的任务**——既不在 `peract_600k` 的 21 任务预训练集中，也不在 Stage 3 微调集中。所有臂在 UnSeen 上**零训练**。
+>
+> **【声明 B′｜码本预训练范围】** 码本与 Adapter 在 `AtomAction_Dataset`（69 任务 / 17 原子）上预训练。UnSeen 的 **Tier-A 6 个在**该 69 任务内（码本见过其原子片段），**Tier-B 2 个不在**。Tier-A 检验原子知识的跨任务迁移（主结果），Tier-B 排除「码本恰好见过该任务」这一替代解释（对照）。
+
+> 旧【声明 A】（「UnSeen 指未参与 Stage 3 微调的任务」）随本次改版**作废**：它承认主干已见过 UnSeen 的完整轨迹，主张只能停在「组合泛化」，撑不起论文要的「码本帮助模型泛化到未见任务」。
 
 ### 2.3 ⚠️ 官方 ckpt 与仓库默认配置的差异
 
@@ -82,38 +86,64 @@ Stage 3 必须按官方 ckpt 的配置构建模型，否则权重加载失配：
 | `replay.batch_size` | 16 | 8 | 三臂一致即可 |
 | `training_iterations` | 600001 | 40000 | Stage 3 另定 K |
 
-### 2.4 任务划分（Seen 12 / UnSeen 6）
+### 2.4 任务划分（Seen 18 / UnSeen 8）
 
-| | 任务 |
-|---|---|
-| **Seen 12** | close_jar, light_bulb_in, open_drawer, place_cups, place_shape_in_shape_sorter, push_buttons, put_groceries_in_cupboard, reach_and_drag, **slide_block_to_color_target**, stack_blocks, **place_wine_at_rack_location**, **sweep_to_dustpan_of_size** |
-| **UnSeen 6** | insert_onto_square_peg, meat_off_grill, put_item_in_drawer, put_money_in_safe, stack_cups, turn_tap |
+> **2026-09 改版**：原划分是在官方 18 任务**内部**按「是否参与 Stage 3 微调」切成 Seen12 / UnSeen6。
+> 实测 `peract_600k` 的 `config.yaml` 后确认：主干在 600k 预训练中见过全部 **21** 个任务（含官方 18 个全部），
+> 因此原 UnSeen6 只能声称「未参与 Stage 3 微调」，撑不起「未见过的任务」这一主张——【声明A】已如实标注过该短板，
+> §7 T1 也把「是否重新划分」列为待定。本次改版把 UnSeen 整体移出官方 18 任务之外，兑现 T1 的待办。
 
-**三条硬约束已按新任务名核验通过**：
+**UnSeen 的检验目标**：**码本能否让策略在主干从未见过的任务上获得增益**。判读以 **B3 − B2** 为核心（码本净贡献，已扣除子任务分割的功劳）。
+
+| | 任务 | 主干见过 | 码本见过 | Stage 3 微调 |
+|---|---|---|---|---|
+| **Seen 18** | 官方 PerAct 18 任务全集 | ✅ 600k 预训练 | 13/18 | ✅ |
+| **UnSeen · Tier-A**（主结果） | `close_drawer`, `pick_up_cup`, `open_jar`, `phone_on_base`, `lamp_on`, `basketball_in_hoop` | ❌ | ✅ 该任务的原子片段 | ❌ 零训练 |
+| **UnSeen · Tier-B**（对照） | `take_money_out_safe`, `take_lid_off_saucepan` | ❌ | ❌ | ❌ 零训练 |
+| **候选备选** | `press_switch`, `put_knife_on_chopping_board` | ❌ | ✅ | ❌ 零训练 |
+
+**Tier-A 检验原子知识的跨任务迁移；Tier-B 排除「码本恰好见过该任务」这一替代解释。两层分列报告，不合并求均值。**
+
+UnSeen 逐任务详情：
+
+| Tier | 任务 | 变体 | 原子序列 | 码本样本 | 与 Seen18 的关系 |
+|---|---|---|---|---|---|
+| A | `close_drawer` | 3 | approach→push | 900 | 同物体反向（`open_drawer` 官方 92%） |
+| A | `pick_up_cup` | 5 | approach→grasp→lift | 1500 | 新物体，颜色 grounding，3 相 |
+| A | `open_jar` | 5 | grasp→rotate→lift→transfer→place | 2500 | 同物体反向（`close_jar` 官方 56%） |
+| A | `phone_on_base` | 1 | approach→grasp→lift→transfer→place | 500 | 新物体，标准 pick-place |
+| A | `lamp_on` | 1 | approach→press | 200 | 新物体，2 相极短 |
+| A | `basketball_in_hoop` | 1 | approach→grasp→lift→transfer | 400 | 新物体，目标容差大 |
+| B | `take_money_out_safe` | 3 | 待标注 | — | 同物体反向（`put_money_in_safe` 官方 32%） |
+| B | `take_lid_off_saucepan` | 1 | 待标注 | — | 新物体，3 相极短 |
+
+**五条硬约束的核验结果**：
 
 | # | 约束 | 结果 |
 |---|---|---|
-| ① | UnSeen 原子并集 ⊆ Seen 原子并集（保证 Exp2 是纯组合泛化，而非"没学过这个动作"的平凡失败） | ✅ 差集为空 |
-| ② | Seen 覆盖 18 任务的全部 13 种原子 | ✅ 差集为空 |
-| ③ | Seen ∪ UnSeen = 18 且不重叠 | ✅ |
+| ① | UnSeen ∩ `peract_600k` 的 21 个预训练任务 = ∅（主干确实没见过） | ✅ 已核 `config.yaml` |
+| ② | UnSeen 与 21 任务无**近重复**（同物体同动作、仅换措辞） | ✅ 已剔除 `put_rubbish_in_bin`(↔`put_rubbish_in_color_bin`)、`sweep_to_dustpan`(↔`sweep_to_dustpan_of_size`)、`change_clock`(↔`set_clock_to_time`)、`push_button`(↔`push_buttons`) |
+| ③ | UnSeen 原子 ⊆ Seen18 的 13 种原子（保证是组合泛化，而非「没学过这个动作」的平凡失败） | ✅ Tier-A 已核；⬜ Tier-B 待数据生成后补标 |
+| ④ | Tier-A ⊆ AtomAction 69 任务；Tier-B ∩ AtomAction 69 = ∅ | ✅ 已核 `dataset_metadata.json` |
+| ⑤ | Seen18 覆盖 18 任务的全部 13 种原子 | ✅ 取全集，天然成立 |
 
-**4 个"独占原子"任务必须留在 Seen**：`sweep_to_dustpan_of_size`→`wipe`、`reach_and_drag`→`slide`、`place_wine_at_rack_location`→`insert`、`place_cups`→`hang`。
-
-> 划分改动后必须重跑本核验。
+> 划分改动后必须重跑本核验。**最终 8 个从 10 个候选中按事先冻结的规则筛出**（先剔 E1 天花板为 0 者，再剔 B0 零样本 sr≥90% 者；筛选不看 B2/B3 任何结果），见 `Exp_Design` 声明E。
 
 ### 2.5 数据规模与划分
 
-沿用官方三分（每任务）：
+| 数据集 | split | 规模 | 状态 | 是否建 cache | 用途 |
+|---|---|---|---|---|---|
+| **Seen 18** | train | 18 × 100 = **1800 ep** | ✅ 已生成 | ✅ 18 任务全部已建 | Stage 3 训练，**全部 1800 条都读** |
+| | val | 18 × 25 = 450 ep | ✅ 已生成 | 🔶 抽 ~50 条 | cache 质量抽检 + checkpoint 选型（选型走真实 rollout，不读 cache） |
+| | test | 18 × 25 = 450 ep | ✅ 已生成 | ❌ 不建 | E0 / E1 / E2 的最终数字 |
+| **UnSeen 候选 10** | test | 10 × 25 = **250 ep**（≈11.7 GB） | ⬜ 待生成 | ❌ 不建 | E1 天花板 + E3 零样本评测 |
+| | train / val | — | ❌ **不生成** | — | UnSeen 不参与任何训练，见下注 |
 
-| split | 规模 | 是否建 cache | 用途 |
-|---|---|---|---|
-| **train** | 18 × 100 = **1800 ep** | ✅ **全部建**（含 UnSeen6） | Stage 3 训练；主线只读 Seen12 的 1200 条 |
-| **val** | 18 × 25 = 450 ep | 🔶 抽 ~50 条 | cache 质量抽检 + checkpoint 选型（选型走真实 rollout，不读 cache） |
-| **test** | 18 × 25 = 450 ep | ❌ 不建 | 最终数字。**完整轨迹 rollout，子任务全部由在线 Planner 实时产出** |
+> **⚠️ UnSeen 不建 train 的连带后果**：评测 B2/B3 需要子任务指令，而 §6 的确定性模板 planner 的模板**取自 train split 的离线 cache** —— UnSeen 没有 train cache 就没有模板。
+> **已决定改用 VLM 在线 planner**（具体方案在 B2/B3 重新训练时确定）。若最终仍回退到模板 planner，则须为 UnSeen 各补 ~25 条 train demo **专用于建模板库**（绝不进 replay，由下述断言硬隔离）。
+> 注意该决定**只影响评测**：Stage 3 训练读的是离线 cache，18 个任务的 cache 已全部建好。
 
-**为何 UnSeen6 的 train 也建 cache**：成本是一次性线性增长（1800 vs 1200 次 API 调用），而不建等于关死「完整 18 任务训练」这一实验配置的门；日后补建会与本批不同源，数据可信度受损。
-
-**⚠️ 防泄漏硬约束**：cache 中存在 UnSeen6 数据，主线实验必须保证不误用。训练启动时**断言**：读到的 `task` 集合 ⊆ 配置声明集合，且 episode 数 == 预期数（Seen12 → 恰好 1200）。必须是**启动即失败**式，不能只写日志。
+**⚠️ 防泄漏硬约束**：训练启动时**断言**：读到的 `task` 集合 ⊆ 配置声明集合（**必须恰好是 Seen18，UnSeen 任一任务出现即失败**），且 episode 数 == 预期数（Seen18 → 恰好 1800）。必须是**启动即失败**式，不能只写日志。
 
 > 依据：`Exp_Design.md` 风险 11 记录过一次真实事故——数据集子集过滤的索引错位导致**静默跨 episode 取数据**，不报任何错。过滤类逻辑必须有硬校验。
 
@@ -516,8 +546,8 @@ Examine the attached front-view image and decide the next phase.
 
 | 任务类型 | 来源 |
 |---|---|
-| Seen 12 | 由该 `(task, variation)` 的离线 cache 统计出的典型子任务序列作为候选模板 |
-| UnSeen 6 | 由 VLM 依据任务指令 + 17 类白名单自主规划（组合泛化测试的应有之义，不提供模板） |
+| Seen 18 | 由该 `(task, variation)` 的离线 cache 统计出的典型子任务序列作为候选模板 |
+| UnSeen 8 | 由 VLM 依据任务指令 + 17 类白名单自主规划（**没有 train cache 就没有模板**，见 §2.5 注；泛化测试本就不该提供模板） |
 
 **Adapter 调用规则**：`NEXT` / `RETRY` / `REPLAN` → 重新调用 Adapter 预测码；`CONTINUE` → 复用当前码。
 
@@ -585,6 +615,8 @@ segment 起始帧 + 指令 → 冻结 Adapter        → (k_g^, k_d^)           
 
 **处置**：记录风险，不为此调整训练数据。按 §3.3 仍照常调用码本，先跑出端到端结果，再决定是否对这些段关闭码注入——这本身构成一个现成的消融点。
 
+**2026-09 补充｜UnSeen 侧的覆盖情况**：新 UnSeen 8 个任务中，**Tier-A 6 个全部在** AtomAction 69 任务内（码本见过其原子片段），**Tier-B 2 个全部不在**——这不是风险，而是 §2.4 刻意设计的两层对照（见【声明 B′】）。
+
 ### R3 码标签高度任务特异
 
 `Adapter_Design §7 R3` 实测：跨任务迁移（用其它任务同 action 的众数预测本任务）的 `k_global` 命中率仅 **21.3%**，低于仅靠 action 的 25.0%；而 `(action, task)` 众数达 54.4%，逼近完整指令组的 56.8%。
@@ -599,20 +631,21 @@ segment 起始帧 + 指令 → 冻结 Adapter        → (k_g^, k_d^)           
 
 **处置**：接受现状，先跑通到 Stage 3 拿端到端结果。报告细节码指标时必须注明只有 1 个自由度。
 
-### T1 ⚠️ 待定：UnSeen6 的信号强度不足
+### T1 ✅ 已解决（2026-09）：UnSeen 的信号强度不足
 
-以官方 `peract_600k` 在官方 test 集上的成绩（step 420k）为参照：
+**原问题**：以官方 `peract_600k` 在 test 集上的成绩为参照，旧 UnSeen6 中只有 2 个任务（`put_item_in_drawer` 60%、`put_money_in_safe` 32%）落在有信号区间，其余 2 个触天花板（`turn_tap` 96%、`meat_off_grill` 92%）、2 个在地板（`insert_onto_square_peg` 8%、`stack_cups` 4%）。结论建立在 2 个任务上，偏薄。
 
 | | 地板（≤8%） | 可用 | 天花板（≥90%） | 均值 |
 |---|---|---|---|---|
-| Seen 12 | 4 | **6** | 2 | 43.7% |
-| UnSeen 6 | 2 | **2** | 2 | 48.7% |
+| 旧 Seen 12 | 4 | **6** | 2 | 43.7% |
+| 旧 UnSeen 6 | 2 | **2** | 2 | 48.7% |
 
-**UnSeen6 中只有 2 个任务（`put_item_in_drawer` 60%、`put_money_in_safe` 32%）落在有信号的区间**，其余 2 个触天花板（`turn_tap` 96%、`meat_off_grill` 92%）、2 个在地板（`insert_onto_square_peg` 8%、`stack_cups` 4%）。Exp2 的结论将主要建立在 2 个任务上，偏薄。
+**处置**：本条原文即写着「待定：是否重新优化 Seen/UnSeen 划分」。§2.4 的 2026-09 改版执行了这一待办——UnSeen 整体移出官方 18 任务，改从 21 个预训练任务之外选取，并按难度梯度挑选（避开天花板与地板），同时用【声明E】的事先冻结规则从 10 个候选中筛出最终 8 个。
 
-**部分缓解**：Stage 3 只在 Seen12 上微调可训头，UnSeen6 可能因头部特化而从上述数字回落，天花板任务或将进入可用区间。但这同时会拉低三臂在 UnSeen 上的绝对值。
-
-**待定**：是否重新优化 Seen/UnSeen 划分以平衡信号强度。约束是 §2.4 的三条硬约束 + 4 个独占原子任务必须留在 Seen。任何改动都需重跑核验。
+**残留风险**：新 UnSeen 是主干真正没见过的任务，四臂**全部趴在地板**的可能性显著存在。三条缓解：
+1. 8 个中有 3 个是「同物体反向」任务（`close_drawer` / `open_jar` / `take_money_out_safe`），与 Seen 共享物体与场景，是防地板的保险；
+2. 定案前先跑 **E1 天花板** + **B0 零样本摸底**，剔掉本就执行不了的任务；
+3. 10 个候选全部生成数据，主结果报定案的 8 个，另 2 个进附录——无论筛选结果如何都不必补生成。
 
 ### T2 待补：Phase_Action_Label.csv 的 3 个缺失任务
 
@@ -733,7 +766,8 @@ u0 = self.up0(latents)                                          # → final → 
 **决策：三臂共用同一份 replay，各臂按需读取字段。**
 
 理由：
-- **磁盘**：单样本约 1.66 MB（4 相机 × (rgb + point_cloud) × 3×128×128 float32 ≈ 1.5 MB，加 `lang_token_embs` 77×512 ≈ 154 KB）。1200 demo 估算 7.2 万–21.6 万样本 → **单份 120–360 GB**，建三份不可接受。共享方案的额外开销仅 **+10%**（多一套子任务语言嵌入）。
+- **磁盘**：**实测**单样本 1.25 MB（含 subtask 字段）。Seen12（1200 demo）实测 165,773 样本 / **203 GB**；改版后的 **Seen18（1800 demo）为 239,871 样本 / 292.8 GB**（逐任务数由 `keyframe_stats.json` + planner cache 独立复算，公式已在 4 个任务上与实测逐位核对）。建三份不可接受。共享方案的额外开销仅 **+10%**（多一套子任务语言嵌入）。
+  > `replay_capacity` 为 300,000，Seen18 的 239,871 仍有 20% 余量，无需调整。
 - **公平性**：三臂在同一种子下看到**逐条相同、顺序相同**的样本，比重建三次强得多。
 
 #### 8.6.1 字段命名规约（防混淆）
@@ -806,7 +840,7 @@ B3      白名单：B2 白名单 + {subtask_k_global, subtask_k_detail, subtask_
 
 **天然的无码暴露仍然存在**：`subtask_code_mask = 0` 的样本（`pose-adjust` 及白名单外动作，§3.3）在训练中自然出现，注入层仍会见到 `code_mask = 0` 的情况，`code_mask` 的硬关断路径不会失去训练信号。
 
-> ⚠️ **需实测**：Seen12 中 `pose-adjust` 只出现在 `put_groceries_in_cupboard` 与 `reach_and_drag`，占比可能很低。cache 生成后应统计 `code_mask = 0` 的样本比例；若接近 0，则 `code_mask` 关断路径实际未被训练到，需在单元测试（§8.4 红线 3）之外额外留意。
+> ⚠️ **需实测**：Seen18 中 `pose-adjust` 只出现在 `put_groceries_in_cupboard` 与 `reach_and_drag`，占比可能很低。cache 生成后应统计 `code_mask = 0` 的样本比例；若接近 0，则 `code_mask` 关断路径实际未被训练到，需在单元测试（§8.4 红线 3）之外额外留意。
 >
 > **残余风险**：若日后需要"码本可选"的部署模式（例如对 R2 中的稀缺原子任务动态关码），届时需重新引入 code-dropout 并重训。
 
@@ -837,9 +871,11 @@ replay 使用 `use_disk: True`。样本数取决于 demo 长度与关键帧数�
 
 **建议**：正式训练前先对 1 个任务填一次 replay，实测单样本大小与样本数，外推总量并确认磁盘容量。
 
-#### P3 UnSeen6 上的灾难性遗忘
+#### P3 UnSeen 上的地板风险（原「灾难性遗忘」，2026-09 改写）
 
-只在 Seen12 上微调动作头会使其特化，UnSeen6 相对 B0 可能**下降**。三臂受影响相同，不损害对比公平性，但会拉低 UnSeen 的绝对值（这也部分缓解了 §7 T1 的天花板问题）。**结果中必须同时报 B0 作为参照。**
+在 Seen18 上微调动作头会使其向这 18 个任务特化，而新 UnSeen 是主干**从未见过**的任务——三臂在其上的绝对值可能很低甚至趋零。三臂受影响相同，**不损害对比公平性**，但会削弱 E3 的判读力。
+
+缓解见 §7 T1（同物体反向任务作保险 + 定案前的天花板/摸底筛选）。**结果中必须同时报 B0 作为参照**：B0 未经 Stage 3 微调，是「微调是否损害了跨任务泛化」的唯一参照系。
 
 #### P4 评测管线依赖在线 Planner
 
@@ -852,7 +888,7 @@ replay 使用 `use_disk: True`。样本数取决于 demo 长度与关键帧数�
 见 [Exp_Design.md](Exp_Design.md)。要点：
 
 - **四臂对比** B0（官方原样）/ B1（baseline）/ B2（planner-only）/ B3（ours），定义见 §8.5。
-- **P0 实验**：E0 评测管线校验（前提门禁）· E1 天花板基线 · E2 Seen12 对比 · E3 UnSeen6 对比 · E7 原子动作动机实验。
+- **P0 实验**：E0 评测管线校验（前提门禁）· E1 天花板基线 · E2 **Seen18** 四臂对比 · E3 **UnSeen8 零样本**四臂对比（Tier-A/B 分列）· E7 原子动作动机实验。
 - **一次评测、多重视图**：5 次评测运行（`b0_official` / `b1_seed0` / `b2_seed0` / `b3_seed0` / `replay_ceiling`）× 18 任务 × 25 局，各实验是对同一份 rollout 记录的聚合视图，B0 不重复评测。
 - **统计口径**：单种子，不报 mean±std，逐任务分列 + 天花板归一化。
 - **视频录制**：所有评测脚本统一保留；录制与落盘解耦（episode 结束后按成败决定是否写盘），避免体积膨胀。

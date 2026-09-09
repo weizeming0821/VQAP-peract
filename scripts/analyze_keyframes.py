@@ -45,12 +45,11 @@ PERACT_18 = [
     "place_shape_in_shape_sorter", "push_buttons", "insert_onto_square_peg",
     "stack_cups", "place_cups",
 ]
-SEEN12 = {
-    "close_jar", "light_bulb_in", "open_drawer", "place_cups",
-    "place_shape_in_shape_sorter", "push_buttons", "put_groceries_in_cupboard",
-    "reach_and_drag", "slide_block_to_color_target", "stack_blocks",
-    "place_wine_at_rack_location", "sweep_to_dustpan_of_size",
-}
+# 🔴 Seen12 划分已于 2026-09 作废（现在是 Seen18 全集，见 stage3/tasks.py）。
+# 本脚本是 replay 体积估算工具，输出里的 `seen12_*` 字段只对旧工件有意义；
+# 保留字段名是为了旧的 keyframe_stats.json 仍能读，**不要拿它做新的口径判断**。
+from stage3.tasks import LEGACY_SEEN12                                # noqa: E402
+SEEN12 = set(LEGACY_SEEN12)
 # fill_replay 的默认值，三臂一致（VLA_Design §4.3）
 DEMO_AUG_EVERY_N = 10
 # P0 实测：open_drawer 10 demo -> 373 个 .replay 文件 / 410 MB

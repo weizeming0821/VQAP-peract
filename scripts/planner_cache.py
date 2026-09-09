@@ -53,13 +53,9 @@ from planner.offline import (                                        # noqa: E40
 )
 from planner.prompts import build_system_prompt, build_user_content  # noqa: E402
 
-SEEN12 = ["close_jar", "light_bulb_in", "open_drawer", "place_cups",
-          "place_shape_in_shape_sorter", "push_buttons", "put_groceries_in_cupboard",
-          "reach_and_drag", "slide_block_to_color_target", "stack_blocks",
-          "place_wine_at_rack_location", "sweep_to_dustpan_of_size"]
-UNSEEN6 = ["insert_onto_square_peg", "meat_off_grill", "put_item_in_drawer",
-           "put_money_in_safe", "stack_cups", "turn_tap"]
-PERACT_18 = SEEN12 + UNSEEN6
+# 任务划分的真源是 stage3/tasks.py（见那里的说明：这份名单曾被抄在四个文件里）。
+# PERACT_18 是官方 18 任务全集，2026-09 改版后它就是 Seen18。
+from stage3.tasks import SEEN18 as PERACT_18                          # noqa: E402
 
 EPISODE_FIELDS = ("variation", "task_instruction", "keypoints", "gripper_at_keypoints",
                   "demo_len", "prior_sequence", "n_repeat_prior", "views_used")

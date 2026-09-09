@@ -28,6 +28,16 @@ OK = True
 WARN = 0
 
 
+def _num_devices(default: int = 2) -> int:
+    """训练配置里的 ddp.num_devices —— 空闲卡够不够，得按它来判。"""
+    try:
+        import yaml
+        d = yaml.safe_load((PERACT_ROOT / "conf" / "stage3.yaml").read_text())
+        return int(d["ddp"]["num_devices"])
+    except Exception:
+        return default
+
+
 def check(name: str, cond: bool, extra: str = "") -> bool:
     global OK
     print(("  ✅ " if cond else "  ❌ ") + name + ("" if cond else f"   {extra}"))
@@ -50,7 +60,10 @@ def main() -> int:
     # ---------------------------------------------------------------- 环境
     section("① 环境")
     import torch
-    check(f"torch {torch.__version__}", torch.__version__.startswith("2.4"))
+    # 🔴 本机 RTX 5090 是 sm_120，torch 必须 ≥ 2.7（cu128）。
+    # 旧机判据写死 2.4.x —— 迁移后它恒 FAIL，等于把整个门禁废掉了。
+    _tv = tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2])
+    check(f"torch {torch.__version__}（sm_120 需 ≥ 2.7）", _tv >= (2, 7))
     check(f"CUDA 可用，{torch.cuda.device_count()} 卡", torch.cuda.is_available())
     import numpy as np
     check(f"numpy {np.__version__}（必须 1.x）", np.__version__.startswith("1."))
@@ -70,44 +83,50 @@ def main() -> int:
         out = subprocess.run(["nvidia-smi", "--query-gpu=index,memory.free",
                               "--format=csv,noheader,nounits"],
                              capture_output=True, text=True, timeout=30).stdout
+        # 阈值按**单卡容量的 85%** 定，而不是写死 40 GB：旧机是 48.5 GB 卡，
+        # 新机 5090 只有 32.6 GB，写死的阈值会让本机永远「零张空闲卡」。
+        cap = torch.cuda.get_device_properties(0).total_memory / 1024 ** 2
+        thr = int(cap * 0.85)
         idle = [l.split(",")[0].strip() for l in out.strip().splitlines()
-                if int(l.split(",")[1]) > 40000]
-        print(f"       空闲 GPU（>40 GB 可用）: {idle}")
-        check(f"至少 2 张空闲卡（当前 {len(idle)}）", len(idle) >= 2,
-              "无法训练，需等待其他用户释放")
-        warn(f"有 6 张空闲卡（当前 {len(idle)}，配置 ddp.num_devices=6）", len(idle) >= 6,
-             "这是共享机器，可用卡数会波动。🔴 三臂必须用**相同的** num_devices，"
-             "否则有效 batch 不同会成为混淆项 —— 请选一个三臂都能保证的卡数，"
-             "并用 CUDA_VISIBLE_DEVICES 锁定具体的卡")
+                if int(l.split(",")[1]) > thr]
+        print(f"       空闲 GPU（>{thr/1024:.0f} GB 可用，单卡 {cap/1024:.0f} GB）: {idle}")
+        need = _num_devices()
+        check(f"至少 {need} 张空闲卡（当前 {len(idle)}）", len(idle) >= need,
+              f"训练配置 ddp.num_devices={need}，凑不齐就训不了")
+        warn(f"够并行两臂（{2*need} 张，当前 {len(idle)}）", len(idle) >= 2 * need,
+             "🔴 三臂必须用**相同的** num_devices，否则有效 batch 不同会成为混淆项。"
+             "卡不够就串行排队，不要为了并行改某一臂的卡数")
     except Exception as exc:
         warn("GPU 空闲检测", False, str(exc)[:60])
 
     # ---------------------------------------------------------------- 磁盘
     section("② 磁盘")
     free_gb = shutil.disk_usage(REPO_ROOT).free / 1024 ** 3
-    print(f"       /data0 可用 {free_gb:.0f} GB")
-    check("≥ 240 GB（replay 202 + ckpt 12 + 余量）", free_gb >= 240,
+    print(f"       数据盘可用 {free_gb:.0f} GB（replay 已建成 293 GB，不再需要重建余量）")
+    # 后续产物：四臂各 9 个 ckpt × 0.17 GB ≈ 6 GB，加评测录像与归档，20 GB 够用。
+    check("≥ 20 GB（四臂 ckpt 6 GB + 评测产物 + 余量）", free_gb >= 20,
           f"仅 {free_gb:.0f} GB")
-    warn("≥ 300 GB（宽松余量；其他用户在持续消耗）", free_gb >= 300)
+    warn("≥ 60 GB（宽松余量）", free_gb >= 60)
 
     # ---------------------------------------------------------------- 数据
     section("③ RLBench 数据")
-    SEEN12 = ["close_jar", "light_bulb_in", "open_drawer", "place_cups",
-              "place_shape_in_shape_sorter", "push_buttons",
-              "put_groceries_in_cupboard", "reach_and_drag",
-              "slide_block_to_color_target", "stack_blocks",
-              "place_wine_at_rack_location", "sweep_to_dustpan_of_size"]
+    from stage3.tasks import SEEN18, UNSEEN10, ALL_EVAL_TASKS
     bad = []
-    for t in SEEN12:
+    for t in SEEN18:
         d = REPO_ROOT / "aavla_data/rlbench" / "train" / t / "all_variations" / "episodes"
         n = len([e for e in d.glob("episode*") if (e / "low_dim_obs.pkl").is_file()]) if d.is_dir() else 0
         if n != 100:
             bad.append(f"{t}={n}")
-    check(f"Seen12 train 每任务 100 episode", not bad, f"异常: {bad}")
-    for split, want in (("val", 25), ("test", 25)):
+    check("Seen18 train 每任务 100 episode", not bad, f"异常: {bad}")
+    # val 只有 Seen18；test 还要覆盖 UnSeen 的 10 个候选（2026-09 改版）。
+    for split, n_task in (("val", len(SEEN18)), ("test", len(ALL_EVAL_TASKS))):
         n = len(glob.glob(str(REPO_ROOT / "aavla_data/rlbench" / split / "*" /
                               "all_variations" / "episodes" / "episode*" / "low_dim_obs.pkl")))
-        check(f"{split} 共 {18*want} episode（实测 {n}）", n == 18 * want)
+        check(f"{split} 共 {n_task*25} episode（{n_task} 任务 × 25，实测 {n}）",
+              n == n_task * 25)
+    miss = [t for t in UNSEEN10
+            if not (REPO_ROOT / "aavla_data/rlbench/test" / t).is_dir()]
+    check(f"UnSeen 候选 {len(UNSEEN10)} 个的 test 数据齐全", not miss, f"缺: {miss}")
 
     # ---------------------------------------------------------------- cache
     section("④ Planner cache")
@@ -117,8 +136,8 @@ def main() -> int:
         print(f"       {c.summary()}")
         check("18 个任务", len(c.tasks()) == 18)
         check(f"可用 episode {len(c._eps)} ≥ 1780", len(c._eps) >= 1780)
-        n_seen12 = sum(1 for (t, s, _) in c._eps if t in SEEN12 and s == "train")
-        check(f"Seen12 train 可用 {n_seen12} ≥ 1180", n_seen12 >= 1180)
+        n_seen18 = sum(1 for (t, sp, _) in c._eps if t in SEEN18 and sp == "train")
+        check(f"Seen18 train 可用 {n_seen18} ≥ 1780", n_seen18 >= 1780)
         ep = next(iter(c._eps.values()))
         seg = ep["segments"][0]
         check("segment 已补码（k_global / k_detail）",
@@ -159,8 +178,12 @@ def main() -> int:
               list(cfg.method.transform_augmentation.aug_rpy) == [0.0, 0.0, 0.0])
         check("task_uniform == True（拉平 stack_blocks 的 35% 占比）",
               cfg.replay.task_uniform is True)
-        check(f"Seen12 共 12 个任务（实测 {len(cfg.rlbench.tasks)}）",
-              len(cfg.rlbench.tasks) == 12)
+        from stage3.tasks import SEEN18 as _S18, UNSEEN10 as _U10
+        check(f"训练任务集 == Seen18（实测 {len(cfg.rlbench.tasks)} 个）",
+              list(cfg.rlbench.tasks) == _S18)
+        # 🔴 防泄漏（VLA_Design §2.5）：UnSeen 是零训练评测集，一个都不许进训练列表
+        leak = [t for t in cfg.rlbench.tasks if t in _U10]
+        check("训练任务集不含任何 UnSeen 任务", not leak, f"泄漏: {leak}")
         check("replay.path 三臂共享（路径里不含 arm）",
               "${" not in str(cfg.replay.path) and "B1" not in str(cfg.replay.path))
         print(f"       LR={cfg.method.lr}  batch/卡={cfg.replay.batch_size}  "
