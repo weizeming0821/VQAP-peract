@@ -224,7 +224,79 @@ def build_online_user_content(task: str, task_instruction: str,
 
 # --------------------------------------------- 在线 Planner：开局/重规划的 PLAN
 
-def build_plan_system_prompt() -> str:
+_PHRASING_PROTOCOL_WITH_LIST = """ON THE PHRASINGS LIST - THIS IS A HARD PROTOCOL, NOT A SUGGESTION
+You are given a NUMBERED list of the exact instruction strings the downstream
+controller was trained on, for THIS task and THIS scene configuration.
+
+Measured on a previous run: only 45% of freely-written instructions matched the
+training wording, and the three tasks whose wording matched worst lost 34-40
+percentage points of success rate. Wording that is semantically perfect but
+phrased differently is an out-of-distribution input to the controller.
+
+For every step, pick ONE of three forms, strictly in this order of preference:
+
+  (A) REUSE - a listed phrasing describes your step as-is. Give its number:
+        {{"action": "grasp", "phrasing_id": 3}}
+
+  (B) SUBSTITUTE - a listed phrasing has the right shape but names a different
+      object, colour, ordinal or side than what you actually see. Keep its
+      sentence structure and replace only the differing words:
+        {{"action": "grasp", "phrasing_id": 3, "substitute": {{"red": "black"}}}}
+
+  (C) IMITATE - no listed phrasing covers this step at all. Write your own, but
+      IMITATE the patterns above: same grammar, same length, same vocabulary.
+      You may swap the verb, the adjectives and the nouns; do NOT invent a new
+      sentence shape, and do NOT add words the list never uses:
+        {{"action": "wipe", "instruction": "sweep dirt into the short dustpan"}}
+
+Always prefer (A) over (B) over (C). Use (C) only when the list genuinely does
+not cover the step - it exists so that actions outside the list are still
+expressible, not as an escape from (A)/(B).
+"""
+
+#: 没有候选清单时（UnSeen 任务：清单取自 train cache，它们天然没有）。
+#: 仍然强调「贴住训练分布的句式」，因为控制器对措辞分布敏感；只是没有原文可抄。
+_PHRASING_PROTOCOL_NO_LIST = """ON WORDING - NO PHRASINGS LIST IS AVAILABLE FOR THIS TASK
+
+There is no list of training instructions for this task, so you MUST write every
+instruction yourself. Do NOT emit "phrasing_id" - there is nothing to refer to,
+and a plan item without "instruction" cannot be executed.
+
+Write each instruction in the same style the controller was trained on:
+all lowercase, imperative, one atomic step, starting with the prescribed verb,
+keeping the distinguishing words (colour, ordinal, side) from the task
+instruction. Keep the sentence shape plain and short - no clauses, no adverbs.
+"""
+
+
+def _plan_output_example(has_phrasings: bool) -> str:
+    if has_phrasings:
+        return ('{"plan": [\n'
+                '  {"action": "grasp", "phrasing_id": 3},\n'
+                '  {"action": "lift", "phrasing_id": 7},\n'
+                '  {"action": "transfer", "phrasing_id": 11, '
+                '"substitute": {"red": "black"}},\n'
+                '  {"action": "place", "instruction": "place the lid on the black jar"}\n'
+                ']}')
+    return ('{"plan": [\n'
+            '  {"action": "grasp", "instruction": "grasp the black jar lid"},\n'
+            '  {"action": "lift", "instruction": "lift the lid"},\n'
+            '  {"action": "place", "instruction": "place the lid on the table"}\n'
+            ']}')
+
+
+def _phrasing_protocol(has_phrasings: bool) -> str:
+    return (_PHRASING_PROTOCOL_WITH_LIST if has_phrasings
+            else _PHRASING_PROTOCOL_NO_LIST)
+
+
+def build_plan_system_prompt(has_phrasings: bool = True) -> str:
+    """在线规划的 system prompt。
+
+    `has_phrasings=False` 时**不给三层措辞协议** —— 候选清单来自 train cache，
+    UnSeen 任务天然没有。仍然要求 phrasing_id 会让 VLM 照办，而下游查不到候选，
+    2026-09-10 的 B4 探针就因此死了 9 个分片。没有清单时直接要求写 instruction。
+    """
     """在线 PLAN 的 system prompt —— 看当前场景，现场推理出子任务序列。
 
     与离线建 cache 的 `build_system_prompt` 是**不同任务**：
@@ -283,42 +355,9 @@ reference verbatim.
     repetitions. That count is derived from the scene configuration and is
     reliable - do not try to count objects from the image yourself.
 
-ON THE PHRASINGS LIST - THIS IS A HARD PROTOCOL, NOT A SUGGESTION
-You are given a NUMBERED list of the exact instruction strings the downstream
-controller was trained on, for THIS task and THIS scene configuration.
-
-Measured on a previous run: only 45% of freely-written instructions matched the
-training wording, and the three tasks whose wording matched worst lost 34-40
-percentage points of success rate. Wording that is semantically perfect but
-phrased differently is an out-of-distribution input to the controller.
-
-For every step, pick ONE of three forms, strictly in this order of preference:
-
-  (A) REUSE - a listed phrasing describes your step as-is. Give its number:
-        {{"action": "grasp", "phrasing_id": 3}}
-
-  (B) SUBSTITUTE - a listed phrasing has the right shape but names a different
-      object, colour, ordinal or side than what you actually see. Keep its
-      sentence structure and replace only the differing words:
-        {{"action": "grasp", "phrasing_id": 3, "substitute": {{"red": "black"}}}}
-
-  (C) IMITATE - no listed phrasing covers this step at all. Write your own, but
-      IMITATE the patterns above: same grammar, same length, same vocabulary.
-      You may swap the verb, the adjectives and the nouns; do NOT invent a new
-      sentence shape, and do NOT add words the list never uses:
-        {{"action": "wipe", "instruction": "sweep dirt into the short dustpan"}}
-
-Always prefer (A) over (B) over (C). Use (C) only when the list genuinely does
-not cover the step - it exists so that actions outside the list are still
-expressible, not as an escape from (A)/(B).
-
+{_phrasing_protocol(has_phrasings)}
 OUTPUT FORMAT - reply with exactly this shape and nothing else:
-{{"plan": [
-  {{"action": "grasp", "phrasing_id": 3}},
-  {{"action": "lift", "phrasing_id": 7}},
-  {{"action": "transfer", "phrasing_id": 11, "substitute": {{"red": "black"}}}},
-  {{"action": "place", "instruction": "place the lid on the black jar"}}
-]}}
+{_plan_output_example(has_phrasings)}
 
 Do your reasoning silently. Emit only the JSON object.
 """

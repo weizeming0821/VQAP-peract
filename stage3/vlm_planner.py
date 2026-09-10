@@ -759,7 +759,10 @@ class OnlineVLMPlanner:
                                      build_plan_user_content)
         from planner.contract import (use_codebook, normalize_instruction,
                                       NON_CODEBOOK_ACTIONS)
-        msgs = [{"role": "system", "content": build_plan_system_prompt()},
+        # 没有候选清单就别给三层措辞协议 —— 否则 VLM 会照办返回 phrasing_id，
+        # 而下游查不到候选。UnSeen 任务的清单取自 train cache，天然为空。
+        msgs = [{"role": "system", "content": build_plan_system_prompt(
+                     has_phrasings=bool(self._phrasings))},
                 {"role": "user", "content": build_plan_user_content(
                     self.task, self.task_instruction, self._images(frame),
                     done=self.done or None, prior=self.prior,
@@ -882,9 +885,40 @@ def _resolve_phrasing(item: dict, phrasings: list[str]) -> tuple[str, str]:
             return ins, "A"
     ins = item.get("instruction")
     if not ins:
-        raise PlannerError(
-            f"计划项既没有可解析的 phrasing_id 也没有 instruction: {item!r}")
+        # 🔴 绝不为此杀掉分片。实测事故（2026-09-10 B4 探针）：VLM 在**没有候选
+        #    清单**的任务上照样返回 {"action": "approach", "phrasing_id": 0}，
+        #    这里一 raise 就带走整个分片；而分片是交错切分的（tasks[i::n]），
+        #    一个 UnSeen 任务能把同分片的 Seen 任务一起拖死 ——
+        #    9 个分片死掉，28 个任务只剩 7 个出结果。
+        #
+        #    候选清单来自 train cache，UnSeen 天然没有；phrasing_id 越界也会走到
+        #    这里。两种都只是「措辞拿不到」，不是「计划不可执行」——
+        #    用动作名兜底成一句合法指令，让这一局继续跑完，并记账供事后剔除。
+        act = str(item.get("action", "")).strip()
+        if not act:
+            raise PlannerError(f"计划项既没有 action 也没有 instruction: {item!r}")
+        ins = _fallback_instruction(act)
+        return ins, "D"                      # D = 兜底，不属于三层协议
     return str(ins).strip(), "C"
+
+
+#: 动作 → 兜底指令。措辞刻意贴近 train cache 里最常见的句式（动词 + the object），
+#: 因为控制器对措辞分布敏感；但这只是保命用的下策，正常应走 A/B/C。
+_FALLBACK_VERB = {
+    "approach": "move toward the object", "grasp": "grasp the object",
+    "lift": "lift the object", "place": "place the object down",
+    "transfer": "move the object to the target", "push": "push the object",
+    "pull": "pull the object", "rotate": "rotate the object",
+    "press": "press the button", "slide": "slide the object",
+    "insert": "insert the object", "hang": "hang the object",
+    "wipe": "wipe the surface", "flip-open": "flip the lid open",
+    "flip-close": "flip the lid closed", "revolve-in": "screw the object in",
+    "revolve-out": "unscrew the object", "pose-adjust": "adjust the gripper pose",
+}
+
+
+def _fallback_instruction(action: str) -> str:
+    return _FALLBACK_VERB.get(action, f"{action.replace('-', ' ')} the object")
 
 
 def _parse_plan(text: str) -> list[dict]:
