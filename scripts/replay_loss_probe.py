@@ -71,7 +71,8 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--replay", required=True, help="replay 工件目录")
     ap.add_argument("--weights", required=True, help="权重目录，如 .../weights/40000")
-    ap.add_argument("--arm", default="B1", choices=["B0", "B1", "B2", "B3"])
+    ap.add_argument("--arm", default="B1",
+                    choices=["B0", "B1", "B2", "B3", "B4"])
     ap.add_argument("--tasks", nargs="+", default=None,
                     help="限定任务（默认取工件里的全部）。做新旧配对时必须限定为共同的 12 个。")
     ap.add_argument("--batches", type=int, default=500)
@@ -93,7 +94,14 @@ def main() -> int:
 
     if not dist.is_initialized():
         os.environ.setdefault("MASTER_ADDR", "localhost")
-        os.environ.setdefault("MASTER_PORT", "29521")
+        # 🔴 端口不能写死：本脚本要按 checkpoint 并行跑（一卡一个），
+        #    固定端口会让除第一个之外的全部死于 EADDRINUSE，而且报错发生在
+        #    torch.distributed 初始化里，看上去与 loss 探针毫无关系。
+        #    实测 2026-09-10：4 个并行探针死了 3 个。
+        import socket
+        _s = socket.socket(); _s.bind(("", 0))
+        os.environ.setdefault("MASTER_PORT", str(_s.getsockname()[1]))
+        _s.close()
         dist.init_process_group("gloo", rank=0, world_size=1)
 
     from agents import peract_bc

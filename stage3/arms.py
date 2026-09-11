@@ -52,6 +52,15 @@ class Arm:
     # 那样一旦漏传，就会在 B4/ 目录下静默训出一个 v1 模型且不报任何错。
     # 现在 launch_utils.create_agent 一律从这里读，配置里写了不一致的值直接抛异常。
     injector: str = "v1"
+    #: 细节码支路开关。实测 9 个槽位在样本内恒等占 99.7%，该支路退化成常量偏置。
+    #: 🔴 必须写在臂上、不能放环境变量：2026-09-11 实测事故 —— B4X 用
+    #:    AAVLA_USE_DETAIL=0 训练，评测时忘了传，模型多出一条**从未训练**的
+    #:    随机初始化支路往 latents 注噪声，成绩从 38% 掉到 22%，
+    #:    而 load_weights 对「模型有、ckpt 没有」的键**只保持随机初始化、不报警**。
+    use_detail: bool = True
+    #: 原子支撑度门控（stage3/atom_support.py）。同理必须随臂走 ——
+    #: 训练与评测的门控表不一致，训出来的模型和评测看到的就是两回事。
+    atom_gate: bool = False
 
     @property
     def uses_subtask_lang(self) -> bool:
@@ -85,6 +94,22 @@ ARMS: dict[str, Arm] = {
               "子任务指令 + v2 码注入（纯残差相加，无门控无 FiLM）+ 微调 K 步",
               "注入层形式（对照 B3：码相同、注入机制不同）",
               injector="v2"),
+    # ---- 2026-09-11 新增：把「语言替换」这个变量从码注入臂里摘出去 ----
+    # 实测依据：flat 对照（分段与码逐局逐段相同、只换指令文本）
+    #   B4@40000 子任务指令 32.44%  →  整任务指令 36.22%   Δ=+3.78 pp（450 局 test）
+    # 也就是说「把整任务指令换成子任务指令」这一步本身在**扣分**。
+    # B4L 保留整任务指令，于是它与 B1 的唯一差别就是**有没有注入码** ——
+    # 这是本项目第一次能干净地测出码本的净贡献。
+    "B4L": Arm("B4L", "task", True, True,
+               "整任务指令 + v2 码注入 + 微调 K 步",
+               "码本的净贡献（与 B1 的唯一差别就是码）",
+               injector="v2"),
+    # B4X：在 B4L 之上再叠三项注入侧改动（都由构造参数/环境变量控制，
+    # 见 conf/stage3.yaml 的 stage3.injector_opts）。参数量净减 0.27 M。
+    "B4X": Arm("B4X", "task", True, True,
+               "B4L + 关细节码支路 + 原子支撑度门控",
+               "注入侧两项改动的合计效果",
+               injector="v2", use_detail=False, atom_gate=True),
 }
 
 
@@ -96,13 +121,21 @@ def allowed_fields(arm: str, base_fields: set[str]) -> frozenset[str]:
     """
     a = ARMS[arm]
     native = set(base_fields) - ALL_SUBTASK_FIELDS
-    if not a.uses_subtask_lang:
-        # B0/B1：只看 PerAct 原生字段，一个 subtask_* 都不给
-        return frozenset(native)
-    # B2/B3：整任务语言字段被换成子任务语言字段
-    allow = (native - TASK_LANG_FIELDS) | (SUBTASK_LANG_FIELDS & set(base_fields))
+    if a.uses_subtask_lang:
+        # B2/B3/B4：整任务语言字段被换成子任务语言字段
+        allow = (native - TASK_LANG_FIELDS) | (SUBTASK_LANG_FIELDS & set(base_fields))
+    else:
+        # B0/B1/B4L：保留 PerAct 原生的整任务语言字段
+        allow = set(native)
+    # 🔴 码的权限与语言无关。这里曾经写在 uses_subtask_lang 分支**内部**，
+    #    于是 lang="task" + codes=True 的臂（B4L）会在上面那个分支直接返回，
+    #    一个 subtask_k_* 都拿不到 —— 训出来是个没有码的 B1，而且**不报错**，
+    #    从 loss 和成绩上都看不出来。
     if a.codes:
         allow |= SUBTASK_CODE_FIELDS & set(base_fields)
+        # 原子支撑度门控要按段的动作名决定注不注入码（stage3/atom_support.py）。
+        # subtask_action 是诊断字段，只给码臂开，语言通路不受影响。
+        allow |= {"subtask_action"} & set(base_fields)
     return frozenset(allow)
 
 

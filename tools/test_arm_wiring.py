@@ -58,6 +58,9 @@ def check(name: str, cond: bool, extra: str = "") -> None:
 BASE_TRAINABLE = 2_117_917
 #: 各注入层版本的参数量（tools/test_injector_v2.py 实测）。
 INJECTOR_PARAMS = {"v1": 432_768, "v2": 399_744}
+#: 关掉细节码支路后省下的参数（slot_embed / ln_h / w_q,k,v,o）。
+#: 实测 CodeInjectorV2: use_detail=True 399,744 → False 231,040。
+DETAIL_BRANCH_PARAMS = 168_704
 
 
 def load_cfg(arm: str, injector_override=None):
@@ -78,9 +81,18 @@ def encoder_of(agent):
     return agent._pose_agent._qattention_agents[0]._perceiver_encoder
 
 
+def expected_injector(arm: str) -> int:
+    """该臂的注入层参数量 —— 细节码支路按臂的 use_detail 决定（arms.py 是真源）。"""
+    a = ARMS[arm]
+    n = INJECTOR_PARAMS[a.injector]
+    if not getattr(a, "use_detail", True):
+        n -= DETAIL_BRANCH_PARAMS
+    return n
+
+
 def expected_trainable(arm: str) -> int:
     a = ARMS[arm]
-    return BASE_TRAINABLE + (INJECTOR_PARAMS[a.injector] if a.codes else 0)
+    return BASE_TRAINABLE + (expected_injector(arm) if a.codes else 0)
 
 
 def frozen_trainable(enc) -> int:
@@ -113,8 +125,10 @@ def main() -> int:
             want = {"v1": CodeInjector, "v2": CodeInjectorV2}[a.injector]
             check(f"{arm}: 注入层类 == {want.__name__}（{a.injector}）",
                   isinstance(inj, want), f"实得 {type(inj).__name__}")
-            check(f"{arm}: 注入层参数 {INJECTOR_PARAMS[a.injector]:,}",
-                  inj.n_trainable() == INJECTOR_PARAMS[a.injector],
+            _want_inj = expected_injector(arm)
+            check(f"{arm}: 注入层参数 {_want_inj:,}"
+                  + ("（细节码支路已关）" if not getattr(a, "use_detail", True) else ""),
+                  inj.n_trainable() == _want_inj,
                   f"实得 {inj.n_trainable():,}")
 
         # ③ 冻结后可训参数量 —— 训练日志第一屏那个数

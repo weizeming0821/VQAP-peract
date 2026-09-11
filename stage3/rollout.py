@@ -104,9 +104,12 @@ class _SubtaskAgent:
 
     def __init__(self, inner, planner, tokens: TokenCache,
                  with_codes: bool, code_source=None, robot_state=None,
-                 task: str = "") -> None:
+                 task: str = "", arm: str | None = None) -> None:
         self._inner = inner
         self._task = task
+        #: 臂名 —— 原子支撑度门控按臂启用（真源是 stage3/arms.py 的 Arm.atom_gate）。
+        #: 训练与评测必须用同一张门控表，否则训出来的模型与评测看到的不是一回事。
+        self._arm = arm
         #: 该任务是否被门控掉码本（码本未覆盖它的原子动作）
         self._gated = task in CODE_GATE_OFF
         self._planner = planner
@@ -204,7 +207,13 @@ class _SubtaskAgent:
                 [[kd]], device=dev, dtype=torch.long)
             # 门控：码本没见过这个任务的原子动作时，mask=0（注入层恒等），
             # 语言通路照常 —— 与 pose-adjust 段的处理方式相同，训练时见过。
-            use_cb = st["use_codebook"] and not self._gated
+            # 三重门控：① 计划自带的 use_codebook（pose-adjust 等白名单外动作）
+            #           ② 任务级白名单 AAVLA_CODE_GATE_OFF（分析用，默认关）
+            #           ③ 原子支撑度（stage3/atom_support.py，B4X 用，默认关）
+            #   ③ 必须与训练侧用同一张表，否则训出来的模型与评测看到的不是一回事。
+            from stage3 import atom_support as _asup
+            use_cb = (st["use_codebook"] and not self._gated
+                      and not _asup.gated(st.get("action"), self._arm))
             obs["subtask_code_mask"] = torch.as_tensor(
                 [[1.0 if use_cb else 0.0]], device=dev,
                 dtype=torch.float32)
@@ -334,9 +343,11 @@ class Stage3RolloutGenerator(RolloutGenerator):
 
     def __init__(self, factory, with_codes: bool,
                  trace_dir: str | Path | None = None,
-                 code_source=None, verbose: bool = True) -> None:
+                 code_source=None, verbose: bool = True,
+                 arm: str | None = None) -> None:
         self._factory = factory
         self._with_codes = with_codes
+        self._arm = arm
         self._code_source = code_source
         self._tokens = TokenCache()
         self._trace_dir = Path(trace_dir) if trace_dir else None
@@ -358,7 +369,7 @@ class Stage3RolloutGenerator(RolloutGenerator):
         wrapped = _SubtaskAgent(agent, planner, self._tokens, self._with_codes,
                                 self._code_source,
                                 robot_state=lambda: getattr(env, "_planner_state", None),
-                                task=task)
+                                task=task, arm=self._arm)
         self.last_planner = planner          # 供事后分析取 history
         try:
             yield from super().generator(
