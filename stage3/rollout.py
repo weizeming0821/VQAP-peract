@@ -217,6 +217,11 @@ class _SubtaskAgent:
             obs["subtask_code_mask"] = torch.as_tensor(
                 [[1.0 if use_cb else 0.0]], device=dev,
                 dtype=torch.float32)
+            # 相位：当前是计划里的第几段。与训练时 replay 的 subtask_index 同义 ——
+            # 训练用离线分段的下标，评测用 planner 的当前下标，两者都是「第几段」。
+            obs["subtask_index"] = torch.as_tensor(
+                [[int(getattr(self._planner, "idx", 0))]], device=dev,
+                dtype=torch.long)
 
         if self._pending_rollback is not None:
             j, self._pending_rollback = self._pending_rollback, None

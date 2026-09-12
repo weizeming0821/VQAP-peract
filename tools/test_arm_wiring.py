@@ -61,6 +61,8 @@ INJECTOR_PARAMS = {"v1": 432_768, "v2": 399_744}
 #: 关掉细节码支路后省下的参数（slot_embed / ln_h / w_q,k,v,o）。
 #: 实测 CodeInjectorV2: use_detail=True 399,744 → False 231,040。
 DETAIL_BRANCH_PARAMS = 168_704
+#: 相位嵌入表 MAX_PHASE(24) × dim(128)。
+PHASE_EMBED_PARAMS = 3_072
 
 
 def load_cfg(arm: str, injector_override=None):
@@ -87,6 +89,8 @@ def expected_injector(arm: str) -> int:
     n = INJECTOR_PARAMS[a.injector]
     if not getattr(a, "use_detail", True):
         n -= DETAIL_BRANCH_PARAMS
+    if getattr(a, "use_phase", False):
+        n += PHASE_EMBED_PARAMS
     return n
 
 
@@ -127,7 +131,8 @@ def main() -> int:
                   isinstance(inj, want), f"实得 {type(inj).__name__}")
             _want_inj = expected_injector(arm)
             check(f"{arm}: 注入层参数 {_want_inj:,}"
-                  + ("（细节码支路已关）" if not getattr(a, "use_detail", True) else ""),
+                  + ("（细节码支路已关）" if not getattr(a, "use_detail", True) else "")
+                  + ("（含相位嵌入）" if getattr(a, "use_phase", False) else ""),
                   inj.n_trainable() == _want_inj,
                   f"实得 {inj.n_trainable():,}")
 

@@ -61,6 +61,13 @@ class Arm:
     #: 原子支撑度门控（stage3/atom_support.py）。同理必须随臂走 ——
     #: 训练与评测的门控表不一致，训出来的模型和评测看到的就是两回事。
     atom_gate: bool = False
+    #: 相位嵌入 —— 注入「当前是计划里的第几段」（subtask_index）。
+    #: 依据：段数 vs 成功率 r=−0.41(B0)/−0.46(B1)；短程(≤3段) B0 均值 64.0%，
+    #: 长程(≥5段) 只有 32.9%，差 31.1 pp。PerAct 在一个关键帧只看到当前视觉 +
+    #: 一句**恒定**的整任务指令，长程任务里同一视觉状态会出现在不同阶段，
+    #: 模型无从判断走到哪一步 —— 这正是 planner 知道、模型拿不到的信息。
+    #: 任务无关（只是「第几段」），所以能迁移到 UnSeen；参数仅 24×128=3,072。
+    use_phase: bool = False
 
     @property
     def uses_subtask_lang(self) -> bool:
@@ -110,6 +117,10 @@ ARMS: dict[str, Arm] = {
                "B4L + 关细节码支路 + 原子支撑度门控",
                "注入侧两项改动的合计效果",
                injector="v2", use_detail=False, atom_gate=True),
+    "B4P": Arm("B4P", "task", True, True,
+               "B4L + 相位嵌入（注入当前是计划里的第几段）",
+               "补上 PerAct 拿不到的阶段信息，针对长程任务",
+               injector="v2", use_phase=True),
 }
 
 
@@ -136,6 +147,9 @@ def allowed_fields(arm: str, base_fields: set[str]) -> frozenset[str]:
         # 原子支撑度门控要按段的动作名决定注不注入码（stage3/atom_support.py）。
         # subtask_action 是诊断字段，只给码臂开，语言通路不受影响。
         allow |= {"subtask_action"} & set(base_fields)
+        # 相位嵌入要读「当前是第几段」。同样只给码臂。
+        if a.use_phase:
+            allow |= {"subtask_index"} & set(base_fields)
     return frozenset(allow)
 
 

@@ -37,13 +37,32 @@ import torch.nn.functional as F
 
 
 class CodeInjector(nn.Module):
+    #: 相位嵌入表的行数。实测 replay 里最大段下标是 19（stack_blocks 最长 20 段）。
+    MAX_PHASE = 24
+
     def __init__(self, dim: int = 128, code_dim: int = 512, n_slots: int = 9,
-                 hidden: int = 256, heads: int = 4, use_detail: bool = True) -> None:
+                 hidden: int = 256, heads: int = 4, use_detail: bool = True,
+                 use_phase: bool = False) -> None:
         super().__init__()
         self.dim = dim
         self.n_slots = n_slots
         self.heads = heads
         self.use_detail = use_detail
+        self.use_phase = use_phase
+
+        # ---- (c) 相位嵌入：当前是计划里的第几段 ----
+        # 为什么加这一路（实测依据）：
+        #   段数 vs 成功率 r = −0.41(B0) / −0.46(B1)；
+        #   短程(≤3段) 3 个任务 B0 均值 64.0%，长程(≥5段) 13 个任务只有 32.9%，差 31.1 pp。
+        # PerAct 在一个关键帧只看到当前视觉 + 一句**恒定**的整任务指令，
+        # 长程任务里同一视觉状态会出现在不同阶段（stack_blocks 摞第 2 块和第 3 块
+        # 画面几乎一样），模型无从判断自己走到哪一步 —— 这正是 planner 知道、
+        # 而模型拿不到的信息。
+        # 它**任务无关**（只是「第几段」），所以能迁移到 UnSeen；
+        # 参数量 24×128 = 3,072，可忽略。
+        if use_phase:
+            self.phase_embed = nn.Embedding(self.MAX_PHASE, dim)
+            nn.init.normal_(self.phase_embed.weight, std=0.01)
 
         # ---- (a) 全局码 → FiLM ----
         self.ln_g = nn.LayerNorm(code_dim)
@@ -103,9 +122,11 @@ class CodeInjector(nn.Module):
 
     def forward(self, latents: torch.Tensor, z_g: torch.Tensor,
                 Z_d: torch.Tensor | None = None,
-                code_mask: torch.Tensor | None = None) -> torch.Tensor:
+                code_mask: torch.Tensor | None = None,
+                phase: torch.Tensor | None = None) -> torch.Tensor:
         """
         latents   : [B, C, X, Y, Z]   PerAct 的 latents，C=128
+        phase     : 仅为与 v2 统一调用签名，**v1 不使用** —— v1 行为逐位不变
         z_g       : [B, code_dim]     全局码向量
         Z_d       : [B, S, code_dim]  细节码向量（use_detail=False 时可为 None）
         code_mask : [B] 或 [B,1]      0/1；0 表示该样本关闭码注入，输出与 latents 逐位相同
@@ -233,13 +254,32 @@ class CodeInjectorV2(nn.Module):
     #: 细节码输出投影的初始化尺度。与 v1 相同，实测注入约 17.7%。
     W_O_STD = 0.02
 
+    #: 相位嵌入表的行数。实测 replay 里最大段下标是 19（stack_blocks 最长 20 段）。
+    MAX_PHASE = 24
+
     def __init__(self, dim: int = 128, code_dim: int = 512, n_slots: int = 9,
-                 hidden: int = 256, heads: int = 4, use_detail: bool = True) -> None:
+                 hidden: int = 256, heads: int = 4, use_detail: bool = True,
+                 use_phase: bool = False) -> None:
         super().__init__()
         self.dim = dim
         self.n_slots = n_slots
         self.heads = heads
         self.use_detail = use_detail
+        self.use_phase = use_phase
+
+        # ---- (c) 相位嵌入：当前是计划里的第几段 ----
+        # 为什么加这一路（实测依据）：
+        #   段数 vs 成功率 r = −0.41(B0) / −0.46(B1)；
+        #   短程(≤3段) 3 个任务 B0 均值 64.0%，长程(≥5段) 13 个任务只有 32.9%，差 31.1 pp。
+        # PerAct 在一个关键帧只看到当前视觉 + 一句**恒定**的整任务指令，
+        # 长程任务里同一视觉状态会出现在不同阶段（stack_blocks 摞第 2 块和第 3 块
+        # 画面几乎一样），模型无从判断自己走到哪一步 —— 这正是 planner 知道、
+        # 而模型拿不到的信息。
+        # 它**任务无关**（只是「第几段」），所以能迁移到 UnSeen；
+        # 参数量 24×128 = 3,072，可忽略。
+        if use_phase:
+            self.phase_embed = nn.Embedding(self.MAX_PHASE, dim)
+            nn.init.normal_(self.phase_embed.weight, std=0.01)
 
         # ---- (a) 全局码 → 逐通道残差 ----
         self.ln_g = nn.LayerNorm(code_dim)
@@ -296,7 +336,8 @@ class CodeInjectorV2(nn.Module):
 
     def forward(self, latents: torch.Tensor, z_g: torch.Tensor,
                 Z_d: torch.Tensor | None = None,
-                code_mask: torch.Tensor | None = None) -> torch.Tensor:
+                code_mask: torch.Tensor | None = None,
+                phase: torch.Tensor | None = None) -> torch.Tensor:
         b, c = latents.shape[0], latents.shape[1]
         n_spatial = latents.dim() - 2
         bc_shape = (b, c) + (1,) * n_spatial
@@ -306,6 +347,11 @@ class CodeInjectorV2(nn.Module):
 
         # (a) 全局码：逐通道残差，空间上广播
         g = self.w_g(self.mlp_g(self.ln_g(z_g)))              # [B,C]
+        # (c) 相位：当前是计划里的第几段。与码走同一条残差，同样受 code_mask 约束
+        #     —— mask=0 时整条注入必须与原版逐位相同，这是单测的锚点。
+        if self.use_phase and phase is not None:
+            idx = phase.reshape(-1).long().clamp_(0, self.MAX_PHASE - 1)
+            g = g + self.phase_embed(idx)                     # [B,C]
         h = latents + g.view(bc_shape) * m.view(m_shape)
 
         # (b) 细节码：cross-attn 残差，**没有门控**
